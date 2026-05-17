@@ -4,3 +4,6 @@
 
 # Treat the README's Zeta code blocks as Rust for highlighting
 *.md linguist-language=Markdown
+
+# Zeta source files (.z extension)
+*.z linguist-language=Rust
