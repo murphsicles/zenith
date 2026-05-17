@@ -1,0 +1,95 @@
+// Zenith raw syscall wrappers — pure Zeta, zero C dependency
+// Uses the `syscall()` built-in which emits LLVM inline assembly
+// Linux x86-64 syscall numbers
+
+// ───── x86-64 Linux syscall numbers ─────
+pub const SYS_READ: i64 = 0;
+pub const SYS_WRITE: i64 = 1;
+pub const SYS_OPEN: i64 = 2;
+pub const SYS_CLOSE: i64 = 3;
+pub const SYS_LSEEK: i64 = 8;
+pub const SYS_MMAP: i64 = 9;
+pub const SYS_MUNMAP: i64 = 11;
+pub const SYS_FTRUNCATE: i64 = 77;
+pub const SYS_FSYNC: i64 = 74;
+pub const SYS_MKDIR: i64 = 83;
+pub const SYS_PREAD64: i64 = 17;
+pub const SYS_PWRITE64: i64 = 18;
+pub const SYS_IO_URING_SETUP: i64 = 425;
+pub const SYS_IO_URING_ENTER: i64 = 426;
+pub const SYS_IO_URING_REGISTER: i64 = 427;
+
+// ───── File operations ─────
+
+/// Open a file. Returns file descriptor or negative error code.
+pub fn open(path: i64, flags: i64, mode: i64) -> i64 {
+    syscall(SYS_OPEN, path, flags, mode)
+}
+
+/// Write to a file descriptor
+pub fn write(fd: i64, buf: i64, count: i64) -> i64 {
+    syscall(SYS_WRITE, fd, buf, count)
+}
+
+/// Read from a file descriptor
+pub fn read(fd: i64, buf: i64, count: i64) -> i64 {
+    syscall(SYS_READ, fd, buf, count)
+}
+
+/// Close a file descriptor
+pub fn close(fd: i64) -> i64 {
+    syscall(SYS_CLOSE, fd, 0, 0)
+}
+
+/// Positioned write to a file descriptor
+pub fn pwrite(fd: i64, buf: i64, count: i64, offset: i64) -> i64 {
+    syscall(SYS_PWRITE64, fd, buf, count, offset)
+}
+
+/// Positioned read from a file descriptor
+pub fn pread(fd: i64, buf: i64, count: i64, offset: i64) -> i64 {
+    syscall(SYS_PREAD64, fd, buf, count, offset)
+}
+
+/// Seek on a file descriptor
+pub fn lseek(fd: i64, offset: i64, whence: i64) -> i64 {
+    syscall(SYS_LSEEK, fd, offset, whence)
+}
+
+/// Sync a file descriptor to disk
+pub fn fsync(fd: i64) -> i64 {
+    syscall(SYS_FSYNC, fd, 0, 0)
+}
+
+/// Create a directory
+pub fn mkdir(path: i64, mode: i64) -> i64 {
+    syscall(SYS_MKDIR, path, mode, 0)
+}
+
+/// Truncate a file to a given length
+pub fn ftruncate(fd: i64, length: i64) -> i64 {
+    syscall(SYS_FTRUNCATE, fd, length, 0)
+}
+
+/// Memory-map a file
+pub fn mmap(addr: i64, length: i64, prot: i64, flags: i64, fd: i64, offset: i64) -> i64 {
+    syscall(SYS_MMAP, addr, length, prot, flags, fd, offset)
+}
+
+/// Unmap memory
+pub fn munmap(addr: i64, length: i64) -> i64 {
+    syscall(SYS_MUNMAP, addr, length, 0)
+}
+
+/// io_uring syscall wrappers
+pub fn io_uring_setup(entries: i64, params_ptr: i64) -> i64 {
+    syscall(SYS_IO_URING_SETUP, entries, params_ptr, 0)
+}
+
+pub fn io_uring_enter(ring_fd: i64, to_submit: i64, min_complete: i64, flags: i64) -> i64 {
+    syscall(SYS_IO_URING_ENTER, ring_fd, to_submit, min_complete, flags)
+}
+
+pub fn io_uring_register(ring_fd: i64, opcode: i64, arg: i64, nr_args: i64) -> i64 {
+    syscall(SYS_IO_URING_REGISTER, ring_fd, opcode, arg, nr_args)
+}

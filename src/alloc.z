@@ -1,0 +1,132 @@
+// Zenith memory allocation — arena + libc fallback
+// Arena allocator eliminates per-node malloc overhead for B+ tree nodes
+
+extern fn malloc(size: i64) -> i64;
+extern fn free(ptr: i64);
+extern fn calloc(count: i64, size: i64) -> i64;
+extern fn realloc(ptr: i64, size: i64) -> i64;
+extern fn memcpy(dst: i64, src: i64, n: i64) -> i64;
+extern fn memset(ptr: i64, val: i64, n: i64) -> i64;
+extern fn mmap(addr: i64, length: i64, prot: i64, flags: i64, fd: i64, offset: i64) -> i64;
+extern fn munmap(addr: i64, length: i64) -> i64;
+extern fn posix_memalign(memptr: i64, alignment: i64, size: i64) -> i64;
+
+// ───── Arena allocator (for B+ tree nodes) ─────
+// Eliminates per-node malloc calls. Allocates 64KB slabs, bump-allocates 4KB nodes.
+// Zero fragmentation. Zero deallocation overhead. Bulk-free at epoch boundaries.
+
+pub const ARENA_SLAB_SIZE: i64 = 64 * 1024; // 64KB slabs = 16 nodes per slab
+pub const NODE_SIZE: i64 = 4096;             // Each node is exactly one page
+
+pub struct Arena {
+    current_slab: i64,    // Current slab base pointer
+    slab_offset: i64,     // Current offset within slab
+    slabs: [i64; 1024],   // Track allocated slabs (up to 1024 = 64MB)
+    slab_count: i64,      // Number of slabs allocated
+    total_allocated: i64, // Total bytes allocated (for stats)
+}
+
+impl Arena {
+    pub fn new() -> Arena {
+        Arena {
+            current_slab: 0,
+            slab_offset: 0,
+            slabs: [0; 1024],
+            slab_count: 0,
+            total_allocated: 0,
+        }
+    }
+    
+    /// Allocate a node (PAGE_SIZE bytes, page-aligned)
+    pub fn alloc_node(&mut self) -> i64 {
+        // If current slab is full, allocate a new one
+        if self.current_slab == 0 || self.slab_offset + NODE_SIZE > ARENA_SLAB_SIZE {
+            self.alloc_slab();
+        }
+        
+        let ptr = self.current_slab + self.slab_offset;
+        self.slab_offset += NODE_SIZE;
+        self.total_allocated += NODE_SIZE;
+        ptr
+    }
+    
+    fn alloc_slab(&mut self) {
+        // Use mmap for page-aligned allocation (no wasted space from malloc headers)
+        let ptr = mmap(
+            0,                    // addr: let kernel choose
+            ARENA_SLAB_SIZE,      // length
+            3,                    // prot: PROT_READ | PROT_WRITE
+            0x22,                 // flags: MAP_PRIVATE | MAP_ANONYMOUS
+            -1,                   // fd: -1 for anonymous
+            0,                    // offset
+        );
+        
+        if ptr == -1 || ptr == 0 {
+            // Fallback to calloc
+            let fallback = calloc(1, ARENA_SLAB_SIZE);
+            if fallback == 0 {
+                panic("Arena: out of memory");
+            }
+            self.current_slab = fallback;
+        } else {
+            self.current_slab = ptr;
+        }
+        
+        self.slab_offset = 0;
+        self.slabs[self.slab_count as usize] = self.current_slab;
+        self.slab_count += 1;
+    }
+    
+    /// Bulk-free all allocated slabs
+    pub fn reset(&mut self) {
+        let mut i: i64 = 0;
+        while i < self.slab_count {
+            let slab = self.slabs[i as usize];
+            if slab != 0 {
+                munmap(slab, ARENA_SLAB_SIZE);
+            }
+            i += 1;
+        }
+        self.current_slab = 0;
+        self.slab_offset = 0;
+        self.slab_count = 0;
+        self.total_allocated = 0;
+    }
+    
+    pub fn allocated_bytes(&self) -> i64 {
+        self.total_allocated
+    }
+}
+
+// ───── Standard libc wrappers (fallback for variable-size allocations) ─────
+
+pub fn alloc(size: i64) -> i64 {
+    if size == 0 { return 0; }
+    malloc(size)
+}
+
+pub fn alloc_zero(count: i64, size: i64) -> i64 {
+    calloc(count, size)
+}
+
+pub fn dealloc(ptr: i64) {
+    if ptr != 0 {
+        free(ptr);
+    }
+}
+
+pub fn resize(ptr: i64, size: i64) -> i64 {
+    realloc(ptr, size)
+}
+
+pub fn copy(dst: i64, src: i64, n: i64) {
+    if n > 0 {
+        memcpy(dst, src, n);
+    }
+}
+
+pub fn zero(ptr: i64, n: i64) {
+    if n > 0 {
+        memset(ptr, 0, n);
+    }
+}

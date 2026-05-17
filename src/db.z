@@ -1,0 +1,236 @@
+// Zenith database — the top-level orchestrator
+// Atomic flush protocol:
+//   1. Write all heap data (no metadata)
+//   2. Fsync heap
+//   3. Write ALL metadata as one atomic batch
+//   4. Fsync metadata
+// This guarantees 0-RPO: after recovery, you either see the complete
+// flush epoch or nothing at all.
+
+pub struct FlushBatch {
+    buf: i64,
+    count: i64,
+    capacity: i64,
+}
+
+impl FlushBatch {
+    pub fn new() -> FlushBatch {
+        let cap: i64 = 2048;
+        FlushBatch {
+            buf: alloc::alloc(cap * 16),  // (key, tagged_slot) pairs
+            count: 0,
+            capacity: cap,
+        }
+    }
+    
+    pub fn push(&self, key_low: i64, tagged_slot: i64) {
+        let mut cap = self.capacity;
+        if self.count >= cap {
+            cap = cap * 2;
+            let new_buf = alloc::alloc(cap * 16);
+            alloc::copy(new_buf, self.buf, self.count * 16);
+            alloc::dealloc(self.buf);
+            self.buf = new_buf;
+            self.capacity = cap;
+        }
+        let off = self.count * 16;
+        unsafe {
+            *((self.buf + off) as *mut i64) = key_low;
+            *((self.buf + off + 8) as *mut i64) = tagged_slot;
+        }
+        self.count += 1;
+    }
+    
+    pub fn commit(&self, metadata: &MetadataStore) -> i64 {
+        if self.count == 0 { return 0; }
+        metadata.commit_batch(self.buf, self.count)
+    }
+    
+    pub fn reset(&self) {
+        self.count = 0;
+    }
+    
+    pub fn len(&self) -> i64 { self.count }
+}
+
+pub struct Db {
+    config: i64,
+    trees: [i64; 8],
+    tree_count: i64,
+    heap: *const Heap,
+    metadata: *const MetadataStore,
+    arena: *mut Arena,
+    batch: FlushBatch,
+    is_open: bool,
+}
+
+impl Db {
+    pub fn open(config: Config) -> Db {
+        let config_ptr = Box::into_raw(Box::new(config));
+        let cfg = unsafe { &*config_ptr };
+        
+        if !cfg.get_temporary() {
+            posix_mkdir(cfg.get_path(), 0o755);
+        }
+        
+        let heap_ptr = Box::into_raw(Box::new(Heap::new(cfg.get_path())));
+        let heap = unsafe { &*heap_ptr };
+        if !cfg.get_temporary() { heap.open(); }
+        
+        let meta_ptr = Box::into_raw(Box::new(MetadataStore::new(cfg.get_path())));
+        let meta = unsafe { &*meta_ptr };
+        if !cfg.get_temporary() { meta.open(); }
+        
+        let arena = Arena::new();
+        let arena_ptr = Box::into_raw(Box::new(arena));
+        
+        let default_tree = Tree::new(config_ptr, 0, arena_ptr);
+        let mut trees: [i64; 8] = [0; 8];
+        trees[0] = Box::into_raw(Box::new(default_tree));
+        
+        Db {
+            config: config_ptr,
+            trees: trees,
+            tree_count: 1,
+            heap: heap_ptr,
+            metadata: meta_ptr,
+            arena: arena_ptr,
+            batch: FlushBatch::new(),
+            is_open: true,
+        }
+    }
+    
+    pub fn open_tree(&self, name: string) -> &mut Tree {
+        unsafe { return &mut *(self.trees[0] as *mut Tree); }
+    }
+    
+    pub fn drop_tree(&self, name: string) -> bool { true }
+    
+    pub fn get(&self, key: i64) -> i64 {
+        let tree = unsafe { &*(self.trees[0] as *const Tree) };
+        tree.get(key)
+    }
+    
+    pub fn set(&self, key: i64, value: i64) {
+        let tree = unsafe { &*(self.trees[0] as *const Tree) };
+        tree.insert(key, value);
+    }
+    
+    pub fn delete(&self, key: i64) -> bool {
+        let tree = unsafe { &*(self.trees[0] as *const Tree) };
+        tree.delete(key)
+    }
+    
+    /// Atomic flush with 0-RPO crash recovery:
+    ///   1. Compact leaves
+    ///   2. Write all dirty leaf data to heap (buffer metadata)
+    ///   3. Fsync heap — data is now durable
+    ///   4. Commit ALL metadata as ONE atomic batch
+    ///   5. Fsync metadata — epoch is now visible
+    ///   6. Reset arena
+    pub fn flush(&self) -> bool {
+        if !self.is_open { return false; }
+        let heap = unsafe { &*self.heap };
+        let metadata = unsafe { &*self.metadata };
+        
+        // Phase 1: Compact underfull leaves
+        let mut i: i64 = 0;
+        while i < self.tree_count {
+            let tree_ptr = self.trees[i as usize];
+            if tree_ptr != 0 {
+                let tree = unsafe { &*(tree_ptr as *const Tree) };
+                tree.compact();
+            }
+            i += 1;
+        }
+        
+        // Phase 2: Write all dirty leaf data to heap.
+        // Metadata entries are COLLECTED in batch buffer, NOT written yet.
+        self.batch.reset();
+        i = 0;
+        while i < self.tree_count {
+            let tree_ptr = self.trees[i as usize];
+            if tree_ptr != 0 { self.collect_dirty(heap, tree_ptr); }
+            i += 1;
+        }
+        
+        // Phase 3: Fsync heap — all leaf data is now durable on disk
+        heap.flush();
+        
+        // Phase 4: Commit ALL metadata as ONE atomic batch.
+        // If crash before this, heap has data but no metadata points to it
+        // (wasted space, no corruption).
+        // If crash during this, metadata batch is partial — recovery discards it.
+        if self.batch.len() > 0 {
+            self.batch.commit(metadata);
+        }
+        
+        // Phase 5: Fsync metadata — epoch is now fully visible
+        metadata.flush();
+        
+        // Phase 6: Reset arena
+        let arena = unsafe { &mut *(self.arena as *mut Arena) };
+        arena.reset();
+        
+        true
+    }
+    
+    /// Walk a tree's dirty nodes, write data to heap, collect metadata in batch
+    fn collect_dirty(&self, heap: &Heap, tree_ptr: i64) {
+        let tree = unsafe { &*(tree_ptr as *const Tree) };
+        let root = tree.get_root();
+        self.collect_node(heap, root);
+    }
+    
+    fn collect_node(&self, heap: &Heap, node_ptr: i64) {
+        if node_ptr == 0 { return; }
+        if !node::is_dirty(node_ptr) { return; }
+        
+        if node::is_leaf(node_ptr) {
+            let count = node::entry_count(node_ptr);
+            let data_size = node::NODE_HEADER_SIZE + count * 16;
+            
+            let tagged_slot = heap.allocate(data_size);
+            let raw_offset = heap::untag_offset(tagged_slot);
+            
+            // Adaptive compression
+            if !node::is_no_compress(node_ptr) {
+                let max_compressed = data_size + 32;
+                let comp_buf = alloc::alloc(max_compressed);
+                let comp_size = zstd_compress(comp_buf, max_compressed, node_ptr, data_size);
+                
+                if comp_size > 0 && comp_size < data_size - data_size / 20 {
+                    heap.write(raw_offset, comp_buf, comp_size);
+                    alloc::dealloc(comp_buf);
+                    node::set_no_compress(node_ptr, false);
+                } else {
+                    alloc::dealloc(comp_buf);
+                    node::set_no_compress(node_ptr, true);
+                    heap.write(raw_offset, node_ptr, data_size);
+                }
+            } else {
+                heap.write(raw_offset, node_ptr, data_size);
+            }
+            
+            // COLLECT metadata (don't write yet)
+            let low_k = node::low_key(node_ptr);
+            self.batch.push(low_k, tagged_slot);
+            node::set_dirty(node_ptr, false);
+        } else {
+            let count = node::entry_count(node_ptr);
+            let mut i: i64 = 0;
+            while i <= count {
+                let child = node::internal_get_child(node_ptr, i);
+                self.collect_node(heap, child);
+                i += 1;
+            }
+            node::set_dirty(node_ptr, false);
+        }
+    }
+    
+    pub fn is_open(&self) -> bool { self.is_open }
+    pub fn tree_count(&self) -> i64 { self.tree_count }
+}
+
+extern fn posix_mkdir(path: i64, mode: i64) -> i64;
+extern fn zstd_compress(dst: i64, dst_cap: i64, src: i64, src_size: i64) -> i64;

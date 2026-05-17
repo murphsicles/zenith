@@ -1,0 +1,5 @@
+// Zenith sync module — lock-free data structures
+// Ported from sled::sync with Zeta-idiomatic patterns
+
+pub mod stack;
+pub mod queue;

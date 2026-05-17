@@ -1,0 +1,241 @@
+// Zenith metadata store — atomic metadata batch writes
+// Each entry is 16 bytes: key_low[8] + tagged_slot[8] (size class in bottom 6 bits)
+// Ported from sled::metadata_store — 33% smaller per entry
+
+pub struct MetadataStore {
+    log_path: string,
+    snap_path: string,
+    log_fd: i64,
+    snap_fd: i64,
+    log_size: i64,
+    snap_size: i64,
+    entries: i64,        // Pointer to array of (key, tagged_slot) pairs
+    entry_count: i64,
+    entry_capacity: i64,
+}
+
+// Entry layout: key_low[8] + tagged_slot[8] = 16 bytes
+const ENTRY_STRIDE: i64 = 16;
+const SNAP_THRESHOLD: i64 = 1024 * 1024; // 1MB — merge log into snapshot
+
+impl MetadataStore {
+    pub fn new(path: string) -> MetadataStore {
+        let log_path = path + "/" + "zenith.meta.log";
+        let snap_path = path + "/" + "zenith.meta.snap";
+        
+        let initial_cap: i64 = 2048;
+        let entries_ptr = alloc::alloc_zero(initial_cap, ENTRY_STRIDE);
+        
+        MetadataStore {
+            log_path: log_path,
+            snap_path: snap_path,
+            log_fd: 0,
+            snap_fd: 0,
+            log_size: 0,
+            snap_size: 0,
+            entries: entries_ptr,
+            entry_count: 0,
+            entry_capacity: initial_cap,
+        }
+    }
+    
+    pub fn open(&self) -> i64 {
+        let log_fd = posix_open_str(self.log_path, 0x42, 0x1B6);
+        if log_fd < 0 { return log_fd; }
+        self.log_fd = log_fd;
+        self.log_size = posix_lseek(log_fd, 0, 2);
+        
+        let snap_fd = posix_open_str(self.snap_path, 0x42, 0x1B6);
+        if snap_fd < 0 { posix_close(log_fd); return snap_fd; }
+        self.snap_fd = snap_fd;
+        self.snap_size = posix_lseek(snap_fd, 0, 2);
+        
+        self.load_snapshot();
+        self.replay_log();
+        0
+    }
+    
+    /// Append a metadata entry: key_low → tagged_slot_offset
+    pub fn append(&self, key_low: i64, tagged_slot: i64) -> i64 {
+        // Ensure capacity
+        if self.entry_count >= self.entry_capacity {
+            let new_cap = self.entry_capacity * 2;
+            let new_ptr = alloc::alloc(new_cap * ENTRY_STRIDE);
+            alloc::zero(new_ptr, new_cap * ENTRY_STRIDE);
+            alloc::copy(new_ptr, self.entries, self.entry_count * ENTRY_STRIDE);
+            alloc::dealloc(self.entries);
+            self.entries = new_ptr;
+            self.entry_capacity = new_cap;
+        }
+        
+        // Store in memory
+        let off = self.entry_count * ENTRY_STRIDE;
+        unsafe {
+            *((self.entries + off) as *mut i64) = key_low;
+            *((self.entries + off + 8) as *mut i64) = tagged_slot;
+        }
+        self.entry_count += 1;
+        
+        // Write to log
+        let buf = alloc::alloc(ENTRY_STRIDE);
+        unsafe {
+            *(buf as *mut i64) = key_low;
+            *((buf + 8) as *mut i64) = tagged_slot;
+        }
+        let result = posix_write(self.log_fd, buf, ENTRY_STRIDE);
+        alloc::dealloc(buf);
+        
+        if result < 0 { return result; }
+        
+        self.log_size += ENTRY_STRIDE;
+        if self.log_size >= SNAP_THRESHOLD {
+            self.merge_to_snapshot();
+        }
+        0
+    }
+    
+    /// Lookup: returns the tagged slot, or 0 if not found
+    pub fn lookup(&self, key_low: i64) -> i64 {
+        // Linear scan (acceptably fast: metadata is small)
+        let mut i: i64 = self.entry_count - 1;
+        while i >= 0 {
+            let off = i * ENTRY_STRIDE;
+            unsafe {
+                let stored_key = *((self.entries + off) as *const i64);
+                if stored_key == key_low {
+                    return *((self.entries + off + 8) as *const i64);
+                }
+            }
+            i -= 1;
+        }
+        0
+    }
+    
+    /// Remove a metadata entry
+    pub fn remove(&self, key_low: i64) {
+        let mut i: i64 = 0;
+        while i < self.entry_count {
+            let off = i * ENTRY_STRIDE;
+            unsafe {
+                let stored_key = *((self.entries + off) as *const i64);
+                if stored_key == key_low {
+                    *((self.entries + off) as *mut i64) = 0; // tombstone
+                }
+            }
+            i += 1;
+        }
+    }
+    
+    /// Atomically commit a batch of entries
+    pub fn commit_batch(&self, batch_data: i64, batch_count: i64) -> i64 {
+        let header_buf = alloc::alloc(ENTRY_STRIDE);
+        unsafe {
+            *(header_buf as *mut i64) = 0x5A454E495448; // "ZENITH" magic
+            *((header_buf + 8) as *mut i64) = batch_count;
+        }
+        let result = posix_write(self.log_fd, header_buf, ENTRY_STRIDE);
+        alloc::dealloc(header_buf);
+        if result < 0 { return result; }
+        
+        let mut i: i64 = 0;
+        while i < batch_count {
+            let entry_off = i * ENTRY_STRIDE;
+            let w = posix_write(self.log_fd, batch_data + entry_off, ENTRY_STRIDE);
+            if w < 0 { return w; }
+            i += 1;
+        }
+        
+        posix_fsync(self.log_fd);
+        
+        // Update in-memory entries
+        i = 0;
+        while i < batch_count {
+            let entry_off = i * ENTRY_STRIDE;
+            unsafe {
+                let k = *((batch_data + entry_off) as *const i64);
+                let s = *((batch_data + entry_off + 8) as *const i64);
+                self.append(k, s);
+            }
+            i += 1;
+        }
+        0
+    }
+    
+    fn merge_to_snapshot(&self) {
+        let snap_fd = posix_open_str(self.snap_path, 0x42 | 0x200, 0x1B6);
+        if snap_fd < 0 { return; }
+        
+        let buf = alloc::alloc(ENTRY_STRIDE);
+        let mut i: i64 = 0;
+        while i < self.entry_count {
+            let off = i * ENTRY_STRIDE;
+            unsafe {
+                let k = *((self.entries + off) as *const i64);
+                if k != 0 { // Skip tombstones
+                    *(buf as *mut i64) = k;
+                    *((buf + 8) as *mut i64) = *((self.entries + off + 8) as *const i64);
+                    posix_write(snap_fd, buf, ENTRY_STRIDE);
+                }
+            }
+            i += 1;
+        }
+        
+        alloc::dealloc(buf);
+        posix_fsync(snap_fd);
+        posix_close(snap_fd);
+        
+        // Truncate log
+        posix_close(self.log_fd);
+        self.log_fd = posix_open_str(self.log_path, 0x42 | 0x200, 0x1B6);
+        self.log_size = 0;
+    }
+    
+    fn load_snapshot(&self) {
+        if self.snap_size == 0 { return; }
+        let buf = alloc::alloc(ENTRY_STRIDE);
+        let mut offset: i64 = 0;
+        while offset < self.snap_size {
+            let bytes = posix_pread(self.snap_fd, buf, ENTRY_STRIDE, offset);
+            if bytes < ENTRY_STRIDE { break; }
+            unsafe {
+                let k = *(buf as *const i64);
+                let s = *((buf + 8) as *const i64);
+                if k != 0 { self.append(k, s); }
+            }
+            offset += ENTRY_STRIDE;
+        }
+        alloc::dealloc(buf);
+    }
+    
+    fn replay_log(&self) {
+        if self.log_size == 0 { return; }
+        let buf = alloc::alloc(ENTRY_STRIDE);
+        let mut offset: i64 = 0;
+        while offset < self.log_size {
+            let bytes = posix_pread(self.log_fd, buf, ENTRY_STRIDE, offset);
+            if bytes < ENTRY_STRIDE { break; }
+            unsafe {
+                let k = *(buf as *const i64);
+                let s = *((buf + 8) as *const i64);
+                if k != 0 && k != 0x5A454E495448 { // Skip magic
+                    self.append(k, s);
+                }
+            }
+            offset += ENTRY_STRIDE;
+        }
+        alloc::dealloc(buf);
+    }
+    
+    pub fn flush(&self) -> i64 {
+        self.merge_to_snapshot();
+        posix_fsync(self.snap_fd)
+    }
+}
+
+extern fn posix_open_str(path: string, flags: i64, mode: i64) -> i64;
+extern fn posix_close(fd: i64) -> i64;
+extern fn posix_write(fd: i64, buf: i64, count: i64) -> i64;
+extern fn posix_pread(fd: i64, buf: i64, count: i64, offset: i64) -> i64;
+extern fn posix_pwrite(fd: i64, buf: i64, count: i64, offset: i64) -> i64;
+extern fn posix_lseek(fd: i64, offset: i64, whence: i64) -> i64;
+extern fn posix_fsync(fd: i64) -> i64;

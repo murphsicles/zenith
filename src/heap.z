@@ -1,0 +1,357 @@
+// Zenith heap — on-disk slab allocator
+// Slot offsets are tagged with the size class index in the bottom 6 bits.
+// All slots are >= 32 bytes aligned, so bottom 6 bits are always 0.
+// This eliminates needing to store the size class separately in metadata.
+
+/// Encode size class index into the bottom 6 bits of a slot offset
+pub fn tag_slot(offset: i64, class_idx: i64) -> i64 {
+    offset | class_idx  // class_idx is 0-63, fits in 6 bits
+}
+
+/// Decode: mask off bottom 6 bits to get the real offset
+pub fn untag_offset(tagged: i64) -> i64 {
+    tagged & !63  // Clear bottom 6 bits
+}
+
+/// Decode: extract size class from bottom 6 bits
+pub fn untag_class(tagged: i64) -> i64 {
+    tagged & 63  // Keep only bottom 6 bits
+}
+// Size classes grow by ~20% (not power-of-two), minimizing fragmentation
+// All class boundaries are CTFE-computed — zero runtime cost
+
+pub const MIN_ALLOC: i64 = 32;
+pub const MAX_ALLOC: i64 = 16 * 1024 * 1024; // 16 MB
+pub const NUM_CLASSES: i64 = 64;
+
+// ───── CTFE: Pre-compute all class boundaries at compile time ─────
+
+/// Generate array of slot sizes for each class index
+comptime fn gen_slot_sizes() -> [NUM_CLASSES]i64 {
+    let mut sizes: [NUM_CLASSES]i64 = [0; 64];
+    let mut size: i64 = MIN_ALLOC;
+    let mut i: i64 = 0;
+    while i < NUM_CLASSES {
+        sizes[i as usize] = size;
+        size = (size * 120) / 100;
+        if size < MIN_ALLOC { size = MIN_ALLOC; }
+        i += 1;
+    }
+    sizes
+}
+
+/// Generate array of max allocatable size per class (inclusive upper bound)
+comptime fn gen_class_upper_bounds() -> [NUM_CLASSES]i64 {
+    let sizes = gen_slot_sizes();
+    let mut bounds: [NUM_CLASSES]i64 = [0; 64];
+    let mut i: i64 = 0;
+    while i < NUM_CLASSES - 1 {
+        // Upper bound for class i is sizes[i+1] - 1
+        // (any size <= sizes[i+1]-1 maps to class i or lower)
+        let next = sizes[(i + 1) as usize];
+        bounds[i as usize] = next - 1;
+        i += 1;
+    }
+    // Last class handles everything up to MAX_ALLOC
+    bounds[(NUM_CLASSES - 1) as usize] = MAX_ALLOC;
+    bounds
+}
+
+/// Pre-computed slot sizes for direct array lookup
+const CLASS_SLOT_SIZES: [NUM_CLASSES]i64 = gen_slot_sizes();
+
+/// Pre-computed upper bounds for binary search in size_class_index
+const CLASS_UPPER_BOUNDS: [NUM_CLASSES]i64 = gen_class_upper_bounds();
+
+// CTFE verification
+comptime fn verify_compiled_tables() {
+    let sizes = gen_slot_sizes();
+    verify_size_class_order(sizes);
+}
+
+comptime fn verify_size_class_order(sizes: [NUM_CLASSES]i64) {
+    let mut prev: i64 = 0;
+    let mut i: i64 = 0;
+    while i < NUM_CLASSES {
+        let sz = sizes[i as usize];
+        if sz <= prev { panic("Size class must grow monotonically"); }
+        if sz < MIN_ALLOC { panic("Size class below minimum"); }
+        prev = sz;
+        i += 1;
+    }
+    if sizes[0] != MIN_ALLOC { panic("First class must be MIN_ALLOC"); }
+}
+
+/// CTFE-compiled: direct array lookup, no loop
+pub comptime fn slot_size_for_class(class_idx: i64) -> i64 {
+    CLASS_SLOT_SIZES[class_idx as usize]
+}
+
+/// CTFE-compiled: binary search over 64 entries = 6 comparisons max
+/// vs. the old runtime while-loop with multiplication per iteration
+pub comptime fn size_class_index(size: i64) -> i64 {
+    if size <= CLASS_SLOT_SIZES[0] { return 0; }
+    if size > CLASS_UPPER_BOUNDS[(NUM_CLASSES - 1) as usize] {
+        return NUM_CLASSES - 1;
+    }
+    
+    // Binary search — guaranteed 6 iterations for 64 classes
+    let mut lo: i64 = 0;
+    let mut hi: i64 = NUM_CLASSES - 1;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let bound = CLASS_UPPER_BOUNDS[mid as usize];
+        if size <= bound {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+// ───── SizeClass and Heap ─────
+
+pub struct SizeClass {
+    slot_size: i64,
+    free_stack_ptr: i64,
+    total_slots: i64,
+    used_slots: i64,
+    file_offset: i64,
+}
+
+impl SizeClass {
+    pub fn new(index: i64) -> SizeClass {
+        let stack = Stack::new();
+        let stack_ptr = Box::into_raw(Box::new(stack));
+        
+        SizeClass {
+            slot_size: CLASS_SLOT_SIZES[index as usize],
+            free_stack_ptr: stack_ptr as i64,
+            total_slots: 0,
+            used_slots: 0,
+            file_offset: 0,
+        }
+    }
+    
+    fn get_stack(&self) -> &Stack {
+        unsafe { &*(self.free_stack_ptr as *const Stack) }
+    }
+    
+    pub fn allocate(&self) -> i64 {
+        let stack = self.get_stack();
+        let free_offset = stack.pop();
+        if free_offset != 0 {
+            return free_offset;
+        }
+        let offset = self.file_offset;
+        self.file_offset += self.slot_size;
+        self.total_slots += 1;
+        self.used_slots += 1;
+        offset
+    }
+    
+    pub fn free(&self, offset: i64) {
+        let stack = self.get_stack();
+        stack.push(offset, 0);
+        self.used_slots -= 1;
+    }
+}
+
+pub struct Heap {
+    classes: i64,
+    heap_file: i64,
+    heap_path: string,
+    total_allocated: i64,
+    file_size: i64,
+}
+
+const CLASS_STRIDE: i64 = 40; // 5 x i64
+
+impl Heap {
+    pub fn new(path: string) -> Heap {
+        let classes_ptr = alloc::alloc_zero(NUM_CLASSES, CLASS_STRIDE);
+        let mut i: i64 = 0;
+        while i < NUM_CLASSES {
+            let class = SizeClass::new(i);
+            let offset = classes_ptr + i * CLASS_STRIDE;
+            unsafe {
+                *(offset as *mut i64) = class.slot_size;
+                *((offset + 8) as *mut i64) = class.free_stack_ptr;
+                *((offset + 16) as *mut i64) = class.total_slots;
+                *((offset + 24) as *mut i64) = class.used_slots;
+                *((offset + 32) as *mut i64) = class.file_offset;
+            }
+            i += 1;
+        }
+        
+        Heap {
+            classes: classes_ptr,
+            heap_file: 0,
+            heap_path: path + "/zenith.heap",
+            total_allocated: 0,
+            file_size: 0,
+        }
+    }
+    
+    fn class_ptr(&self, idx: i64) -> i64 {
+        self.classes + idx * CLASS_STRIDE
+    }
+    
+    pub fn allocate(&self, size: i64) -> i64 {
+        let idx = size_class_index(size);
+        let base = self.class_ptr(idx);
+        
+        let slot_size = CLASS_SLOT_SIZES[idx as usize];
+        let free_stack_ptr = unsafe { *((base + 8) as *const i64) };
+        
+        let stack: &Stack = unsafe { &*(free_stack_ptr as *const Stack) };
+        let free_offset = stack.pop();
+        
+        let offset: i64;
+        if free_offset != 0 {
+            offset = free_offset;
+        } else {
+            let file_off = unsafe { *((base + 32) as *const i64) };
+            offset = file_off;
+            unsafe {
+                *((base + 32) as *mut i64) = file_off + slot_size;
+            }
+            let total = unsafe { *((base + 16) as *const i64) } + 1;
+            unsafe { *((base + 16) as *mut i64) = total; }
+        }
+        
+        let used = unsafe { *((base + 24) as *const i64) } + 1;
+        unsafe { *((base + 24) as *mut i64) = used; }
+        
+        self.total_allocated += slot_size;
+        
+        // Tag the offset with the size class index
+        tag_slot(offset, idx)
+    }
+    
+    pub fn free(&self, tagged: i64) {
+        let idx = untag_class(tagged);
+        let offset = untag_offset(tagged);
+        let base = self.class_ptr(idx);
+        let free_stack_ptr = unsafe { *((base + 8) as *const i64) };
+        let stack: &Stack = unsafe { &*(free_stack_ptr as *const Stack) };
+        stack.push(offset, 0);
+        
+        let used = unsafe { *((base + 24) as *const i64) } - 1;
+        unsafe { *((base + 24) as *mut i64) = used; }
+        
+        self.total_allocated -= CLASS_SLOT_SIZES[idx as usize];
+    }
+    
+    pub fn open(&self) -> i64 {
+        let fd = posix_open_str(self.heap_path, 0x42, 0x1B6);
+        if fd < 0 { return fd; }
+        self.heap_file = fd;
+        self.file_size = posix_lseek(fd, 0, 2);
+        self.restore_from_file();
+        0
+    }
+    
+    /// Write data to heap with CRC32C footer (4 bytes appended after data)
+    /// Total written: size + 4 bytes
+    pub fn write(&self, offset: i64, data: i64, size: i64) -> i64 {
+        let result = posix_pwrite(self.heap_file, data, size, offset);
+        if result < 0 { return result; }
+        
+        // Compute and write CRC footer
+        let crc = checksum::crc32c(data, size);
+        let crc_buf = alloc::alloc(4);
+        unsafe {
+            *(crc_buf as *mut u32) = crc;
+        }
+        let crc_result = posix_pwrite(self.heap_file, crc_buf, 4, offset + size);
+        alloc::dealloc(crc_buf);
+        crc_result
+    }
+    
+    /// Read data from heap and verify CRC
+    /// Returns < 0 on read error, or 0 if CRC mismatch (corruption detected)
+    pub fn read(&self, offset: i64, data: i64, size: i64) -> i64 {
+        let result = posix_pread(self.heap_file, data, size, offset);
+        if result < 0 { return result; }
+        if result < size { return -1; } // Short read
+        
+        // Read and verify CRC footer
+        let crc_buf = alloc::alloc(4);
+        let crc_result = posix_pread(self.heap_file, crc_buf, 4, offset + size);
+        if crc_result < 4 {
+            alloc::dealloc(crc_buf);
+            return -2; // Missing CRC
+        }
+        
+        let stored_crc = unsafe { *(crc_buf as *const u32) };
+        let computed = checksum::crc32c(data, size);
+        alloc::dealloc(crc_buf);
+        
+        if stored_crc != computed {
+            return -3; // CRC mismatch — data corrupted
+        }
+        
+        size
+    }
+    
+    pub fn flush(&self) -> i64 {
+        self.serialize_to_file();
+        posix_fsync(self.heap_file)
+    }
+    
+    fn serialize_to_file(&self) {
+        let meta_fd = posix_open_str(self.heap_path + ".meta", 0x42 | 0x200, 0x1B6);
+        if meta_fd < 0 { return; }
+        
+        let buf = alloc::alloc(CLASS_STRIDE);
+        let mut i: i64 = 0;
+        while i < NUM_CLASSES {
+            let base = self.class_ptr(i);
+            unsafe {
+                *(buf as *mut i64) = *((base + 16) as *const i64); // total_slots
+                *((buf + 8) as *mut i64) = *((base + 24) as *const i64); // used_slots
+                *((buf + 16) as *mut i64) = *((base + 32) as *const i64); // file_offset
+            }
+            posix_write(meta_fd, buf, 24);
+            i += 1;
+        }
+        
+        posix_fsync(meta_fd);
+        posix_close(meta_fd);
+        alloc::dealloc(buf);
+    }
+    
+    fn restore_from_file(&self) {
+        let meta_fd = posix_open_str(self.heap_path + ".meta", 0, 0);
+        if meta_fd < 0 { return; }
+        
+        let buf = alloc::alloc(24);
+        let mut i: i64 = 0;
+        while i < NUM_CLASSES {
+            let bytes = posix_read(meta_fd, buf, 24);
+            if bytes < 24 { break; }
+            let base = self.class_ptr(i);
+            unsafe {
+                *((base + 16) as *mut i64) = *(buf as *const i64);      // total_slots
+                *((base + 24) as *mut i64) = *((buf + 8) as *const i64); // used_slots
+                *((base + 32) as *mut i64) = *((buf + 16) as *const i64); // file_offset
+            }
+            i += 1;
+        }
+        
+        alloc::dealloc(buf);
+        posix_close(meta_fd);
+    }
+}
+
+// POSIX I/O (provided by Zeta runtime)
+extern fn posix_open_str(path: string, flags: i64, mode: i64) -> i64;
+extern fn posix_close(fd: i64) -> i64;
+extern fn posix_write(fd: i64, buf: i64, count: i64) -> i64;
+extern fn posix_read(fd: i64, buf: i64, count: i64) -> i64;
+extern fn posix_pwrite(fd: i64, buf: i64, count: i64, offset: i64) -> i64;
+extern fn posix_pread(fd: i64, buf: i64, count: i64, offset: i64) -> i64;
+extern fn posix_lseek(fd: i64, offset: i64, whence: i64) -> i64;
+extern fn posix_fsync(fd: i64) -> i64;

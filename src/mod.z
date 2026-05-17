@@ -1,0 +1,45 @@
+// Zenith — Zeta-native embedded database
+// Sled-architecture inspired, Zeta-idiomatic implementation
+// Uses CTFE for compile-time optimization, SIMD for hot paths
+
+pub mod config;
+pub mod db;
+pub mod tree;
+pub mod node;
+pub mod heap;
+pub mod metadata;
+pub mod cache;
+pub mod flush;
+pub mod alloc;
+pub mod id_alloc;
+pub mod sync;
+pub mod checksum;
+
+// Re-export public API at crate root
+pub use config::Config;
+pub use db::Db;
+pub use tree::Tree;
+
+/// Result type alias for database operations
+pub type Result<T> = core::result::Result<T, Error>;
+
+/// Zenith error type
+pub enum Error {
+    Io(i64),
+    NotFound,
+    Corruption,
+    Full,
+    InvalidConfig,
+}
+
+impl Error {
+    pub fn description(&self) -> string {
+        match self {
+            Error::Io(code) => format!("IO error: {}", code),
+            Error::NotFound => "Key not found",
+            Error::Corruption => "Data corruption detected",
+            Error::Full => "Database full",
+            Error::InvalidConfig => "Invalid configuration",
+        }
+    }
+}

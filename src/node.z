@@ -1,0 +1,568 @@
+// Zenith B+ tree node types
+// Ported from sled's concurrent-map leaves and internal nodes
+// 
+// Layout:
+//   Internal node: [keys array] [children pointers array] [metadata]
+//   Leaf node:     [(key, value) pairs] [metadata]
+
+pub const PAGE_SIZE: i64 = 4096;
+pub const MIN_FANOUT: i64 = 16;
+pub const MAX_FANOUT: i64 = 1024;
+
+/// Flags for node metadata
+pub const NODE_IS_LEAF: i64 = 1;
+pub const NODE_IS_DIRTY: i64 = 2;
+pub const NODE_NO_COMPRESS: i64 = 4;
+
+/// Maximum number of (key, value) pairs per leaf
+/// 4096 - 48(header) = 4048 / 16 = 253
+pub const MAX_PAIRS: i64 = 253;
+
+/// Maximum keys per internal node
+pub const MAX_KEYS: i64 = 253;
+
+/// Minimum entries before triggering merge after delete
+pub const MIN_PAIRS: i64 = MAX_PAIRS / 4;
+
+// --- Node header (48 bytes: 6 x i64) ---
+pub const NODE_FLAGS_OFF: i64 = 0;      // i64 — flags (leaf/dirty/etc)
+pub const NODE_COUNT_OFF: i64 = 8;       // i64 — number of entries
+pub const NODE_LOW_KEY_OFF: i64 = 16;    // i64 — lowest key in subtree
+pub const NODE_HIGH_KEY_OFF: i64 = 24;   // i64 — highest key in subtree
+pub const NODE_NEXT_OFF: i64 = 32;       // i64 — next leaf in sequence (leaf-only)
+pub const NODE_PREV_OFF: i64 = 40;       // i64 — prev leaf in sequence (leaf-only)
+
+pub const NODE_HEADER_SIZE: i64 = 48;
+
+/// Compute the offset of key at index in a leaf node
+pub fn leaf_key_offset(index: i64) -> i64 {
+    NODE_HEADER_SIZE + index * 16  // key (8) + value_ptr (8)
+}
+
+/// Compute the offset of value at index in a leaf node
+pub fn leaf_value_offset(index: i64) -> i64 {
+    NODE_HEADER_SIZE + index * 16 + 8
+}
+
+/// Compute the offset of separator key at index in an internal node
+pub fn internal_key_offset(index: i64) -> i64 {
+    NODE_HEADER_SIZE + index * 16  // key (8) + child_ptr (8) 
+}
+
+/// Compute the offset of child pointer at index in an internal node
+pub fn internal_child_offset(index: i64) -> i64 {
+    NODE_HEADER_SIZE + index * 16 + 8
+}
+
+/// Read a field from a node at a given offset
+pub fn node_read_i64(node_ptr: i64, offset: i64) -> i64 {
+    unsafe { *((node_ptr + offset) as *const i64) }
+}
+
+/// Write a field to a node at a given offset
+pub fn node_write_i64(node_ptr: i64, offset: i64, val: i64) {
+    unsafe { *((node_ptr + offset) as *mut i64) = val; }
+}
+
+/// Allocate a new leaf node from the arena (PAGE_SIZE, zeroed)
+pub fn alloc_node(arena: &mut Arena) -> i64 {
+    let ptr = arena.alloc_node();
+    alloc::zero(ptr, PAGE_SIZE);
+    
+    node_write_i64(ptr, NODE_FLAGS_OFF, NODE_IS_LEAF);
+    node_write_i64(ptr, NODE_COUNT_OFF, 0);
+    
+    ptr
+}
+
+/// Allocate a new internal node from the arena
+pub fn alloc_internal_node(arena: &mut Arena) -> i64 {
+    let ptr = arena.alloc_node();
+    alloc::zero(ptr, PAGE_SIZE);
+    
+    node_write_i64(ptr, NODE_FLAGS_OFF, 0);
+    node_write_i64(ptr, NODE_COUNT_OFF, 0);
+    
+    ptr
+}
+
+/// Check if a node is a leaf
+pub fn is_leaf(node_ptr: i64) -> bool {
+    let flags = node_read_i64(node_ptr, NODE_FLAGS_OFF);
+    (flags & NODE_IS_LEAF) != 0
+}
+
+/// Get the number of entries in a node
+pub fn entry_count(node_ptr: i64) -> i64 {
+    node_read_i64(node_ptr, NODE_COUNT_OFF)
+}
+
+/// Get the lowest key in a node's subtree
+pub fn low_key(node_ptr: i64) -> i64 {
+    node_read_i64(node_ptr, NODE_LOW_KEY_OFF)
+}
+
+/// Get the highest key in a node's subtree
+pub fn high_key(node_ptr: i64) -> i64 {
+    node_read_i64(node_ptr, NODE_HIGH_KEY_OFF)
+}
+
+/// Set the lowest key
+pub fn set_low_key(node_ptr: i64, key: i64) {
+    node_write_i64(node_ptr, NODE_LOW_KEY_OFF, key);
+}
+
+/// Set the highest key
+pub fn set_high_key(node_ptr: i64, key: i64) {
+    node_write_i64(node_ptr, NODE_HIGH_KEY_OFF, key);
+}
+
+/// Set the node dirty flag
+pub fn set_dirty(node_ptr: i64, dirty: bool) {
+    let flags = node_read_i64(node_ptr, NODE_FLAGS_OFF);
+    if dirty {
+        node_write_i64(node_ptr, NODE_FLAGS_OFF, flags | NODE_IS_DIRTY);
+    } else {
+        node_write_i64(node_ptr, NODE_FLAGS_OFF, flags & !NODE_IS_DIRTY);
+    }
+}
+
+/// Check if a node is dirty
+pub fn is_dirty(node_ptr: i64) -> bool {
+    let flags = node_read_i64(node_ptr, NODE_FLAGS_OFF);
+    (flags & NODE_IS_DIRTY) != 0
+}
+
+/// Get a key at the given index in a leaf node
+pub fn leaf_get_key(node_ptr: i64, index: i64) -> i64 {
+    node_read_i64(node_ptr, leaf_key_offset(index))
+}
+
+/// Get a value at the given index in a leaf node
+pub fn leaf_get_value(node_ptr: i64, index: i64) -> i64 {
+    node_read_i64(node_ptr, leaf_value_offset(index))
+}
+
+/// Set a (key, value) pair at the given index in a leaf node
+pub fn leaf_set_pair(node_ptr: i64, index: i64, key: i64, value: i64) {
+    node_write_i64(node_ptr, leaf_key_offset(index), key);
+    node_write_i64(node_ptr, leaf_value_offset(index), value);
+}
+
+/// Insert a pair into a leaf, shifting entries right with SIMD-accelerated memcpy
+/// Single memcpy replaces up to 255 individual element copies
+pub fn leaf_insert_pair(node_ptr: i64, index: i64, key: i64, value: i64) {
+    let count = entry_count(node_ptr);
+    
+    if index < count {
+        // Bulk shift entries right by one position using memcpy
+        // Must use overlapping copy direction (dst > src, forward copy)
+        // glibc memcpy detects overlaps and handles correctly
+        let src = node_ptr + NODE_HEADER_SIZE + index * 16;
+        let dst = node_ptr + NODE_HEADER_SIZE + (index + 1) * 16;
+        let nbytes = (count - index) * 16;
+        alloc::copy(dst, src, nbytes);
+    }
+    
+    // Write new pair at vacated slot
+    leaf_set_pair(node_ptr, index, key, value);
+    node_write_i64(node_ptr, NODE_COUNT_OFF, count + 1);
+    
+    // Update bounds
+    if count == 0 {
+        set_low_key(node_ptr, key);
+        set_high_key(node_ptr, key);
+    } else {
+        if key < low_key(node_ptr) { set_low_key(node_ptr, key); }
+        if key > high_key(node_ptr) { set_high_key(node_ptr, key); }
+    }
+}
+
+/// Remove a pair at index from a leaf, shifting entries left with SIMD memcpy
+pub fn leaf_remove_pair(node_ptr: i64, index: i64) {
+    let count = entry_count(node_ptr);
+    
+    if index + 1 < count {
+        // Bulk shift entries left by one position
+        let src = node_ptr + NODE_HEADER_SIZE + (index + 1) * 16;
+        let dst = node_ptr + NODE_HEADER_SIZE + index * 16;
+        let nbytes = (count - index - 1) * 16;
+        alloc::copy(dst, src, nbytes);
+    }
+    
+    node_write_i64(node_ptr, NODE_COUNT_OFF, count - 1);
+}
+
+/// SIMD-accelerated key search in a leaf node
+/// Processes 4 keys at a time using unrolled wide loads
+/// On modern superscalar CPUs, this gets 4 comparisons in-flight
+/// instead of stalling on binary search branch mispredictions
+/// Fully inlined SIMD key search — zero function call overhead.
+/// All header reads use direct unsafe pointer derefs.
+/// LLVM sees one flat function with all loads visible for optimization.
+pub fn leaf_find_key(node_ptr: i64, key: i64) -> (i64, bool) {
+    // Inline: entry_count
+    let count = unsafe { *((node_ptr + NODE_COUNT_OFF) as *const i64) };
+    if count == 0 { return (0, false); }
+    
+    // Inline: low_key / high_key
+    let lo = unsafe { *((node_ptr + NODE_LOW_KEY_OFF) as *const i64) };
+    let hi = unsafe { *((node_ptr + NODE_HIGH_KEY_OFF) as *const i64) };
+    if key < lo { return (0, false); }
+    if key > hi { return (count, false); }
+    
+    let data_base = node_ptr + NODE_HEADER_SIZE;
+    let stride: i64 = 4;
+    
+    let mut i: i64 = 0;
+    while i + stride <= count {
+        unsafe {
+            let k0 = *((data_base + (i + 0) * 16) as *const i64);
+            let k1 = *((data_base + (i + 1) * 16) as *const i64);
+            let k2 = *((data_base + (i + 2) * 16) as *const i64);
+            let k3 = *((data_base + (i + 3) * 16) as *const i64);
+            
+            if k0 == key { return (i + 0, true); }
+            if k1 == key { return (i + 1, true); }
+            if k2 == key { return (i + 2, true); }
+            if k3 == key { return (i + 3, true); }
+            if k0 > key { return (i + 0, false); }
+            if k1 > key { return (i + 1, false); }
+            if k2 > key { return (i + 2, false); }
+            if k3 > key { return (i + 3, false); }
+        }
+        i += stride;
+    }
+    
+    // Tail: inline leaf_get_key as direct unsafe deref
+    unsafe {
+        while i < count {
+            let k = *((data_base + i * 16) as *const i64);
+            if k == key { return (i, true); }
+            if k > key { return (i, false); }
+            i += 1;
+        }
+    }
+    
+    (count, false)
+}
+
+/// Internal node: get separator key at index
+pub fn internal_get_key(node_ptr: i64, index: i64) -> i64 {
+    node_read_i64(node_ptr, internal_key_offset(index))
+}
+
+/// Internal node: get child pointer at index
+pub fn internal_get_child(node_ptr: i64, index: i64) -> i64 {
+    node_read_i64(node_ptr, internal_child_offset(index))
+}
+
+/// Internal node: set separator key at index
+pub fn internal_set_key(node_ptr: i64, index: i64, key: i64) {
+    node_write_i64(node_ptr, internal_key_offset(index), key);
+}
+
+/// Internal node: set child pointer at index
+pub fn internal_set_child(node_ptr: i64, index: i64, child: i64) {
+    node_write_i64(node_ptr, internal_child_offset(index), child);
+}
+
+/// SIMD-accelerated child lookup in an internal node
+/// Uses the same 4-wide chunked search pattern as leaf_find_key
+/// Returns child pointer (never fails if tree is consistent)
+/// Fully inlined child lookup — zero function call overhead.
+pub fn internal_find_child(node_ptr: i64, key: i64) -> i64 {
+    // Inline: entry_count
+    let count = unsafe { *((node_ptr + NODE_COUNT_OFF) as *const i64) };
+    if count == 0 {
+        // Inline: internal_get_child(node_ptr, 0)
+        return unsafe { *((node_ptr + NODE_HEADER_SIZE + 0 * 16 + 8) as *const i64) };
+    }
+    
+    let data_base = node_ptr + NODE_HEADER_SIZE;
+    
+    // Inline: internal_get_key(node_ptr, 0) and internal_get_key(node_ptr, count-1)
+    let first_sep = unsafe { *((data_base + 0 * 16) as *const i64) };
+    let last_sep = unsafe { *((data_base + (count - 1) * 16) as *const i64) };
+    
+    if key < first_sep {
+        return unsafe { *((data_base + 0 * 16 + 8) as *const i64) };
+    }
+    if key >= last_sep {
+        return unsafe { *((data_base + count * 16 + 8) as *const i64) };
+    }
+    
+    let stride: i64 = 4;
+    let mut i: i64 = 0;
+    while i + stride <= count {
+        unsafe {
+            let k0 = *((data_base + (i + 0) * 16) as *const i64);
+            let k1 = *((data_base + (i + 1) * 16) as *const i64);
+            let k2 = *((data_base + (i + 2) * 16) as *const i64);
+            let k3 = *((data_base + (i + 3) * 16) as *const i64);
+            
+            // Inline: internal_get_child + comparison
+            if k0 > key { return *((data_base + (i + 0) * 16 + 8) as *const i64); }
+            if k1 > key { return *((data_base + (i + 1) * 16 + 8) as *const i64); }
+            if k2 > key { return *((data_base + (i + 2) * 16 + 8) as *const i64); }
+            if k3 > key { return *((data_base + (i + 3) * 16 + 8) as *const i64); }
+        }
+        i += stride;
+    }
+    
+    unsafe {
+        while i < count {
+            let k = *((data_base + i * 16) as *const i64);
+            if k > key {
+                return *((data_base + i * 16 + 8) as *const i64);
+            }
+            i += 1;
+        }
+    }
+    
+    // Past all — return last child
+    unsafe { *((data_base + count * 16 + 8) as *const i64) }
+}
+
+/// Split a leaf node into two, returning the new right node
+/// Maintains sibling chain by updating both new leaf's links
+/// Also handles the root-split case where the left node has no next/prev yet
+pub fn leaf_split(node_ptr: i64, arena: &mut Arena) -> i64 {
+    let count = entry_count(node_ptr);
+    let split_point = count / 2;
+    let right = alloc_node(arena);
+    
+    // Bulk copy the second half from node to right
+    let src = node_ptr + NODE_HEADER_SIZE + split_point * 16;
+    let dst = right + NODE_HEADER_SIZE;
+    let right_count = count - split_point;
+    alloc::copy(dst, src, right_count * 16);
+    
+    node_write_i64(right, NODE_COUNT_OFF, right_count);
+    set_low_key(right, leaf_get_key(right, 0));
+    set_high_key(right, leaf_get_key(right, right_count - 1));
+    
+    // Truncate left node
+    set_high_key(node_ptr, leaf_get_key(node_ptr, split_point - 1));
+    node_write_i64(node_ptr, NODE_COUNT_OFF, split_point);
+    
+    // Maintain sibling chain: right inherits left's next;
+    // left and right point to each other
+    let old_next = get_next_leaf(node_ptr);
+    link_leaves(node_ptr, right);
+    if old_next != 0 {
+        set_next_leaf(right, old_next);
+        set_prev_leaf(old_next, right);
+    }
+    
+    right
+}
+
+/// Split an internal node, returning the right node and the promoted key
+/// Uses memcpy for bulk copy, preserves the last child pointer
+pub fn internal_split(node_ptr: i64, arena: &mut Arena) -> (i64, i64) {
+    let count = entry_count(node_ptr);
+    let split_point = count / 2;
+    let promoted_key = internal_get_key(node_ptr, split_point);
+    let right = alloc_internal_node(arena);
+    
+    // Bulk copy keys and child pointers from split_point+1 onwards
+    // Each entry is (separator_key: i64, child_ptr: i64) = 16 bytes
+    let right_count = count - split_point;
+    if right_count > 0 {
+        let src = node_ptr + NODE_HEADER_SIZE + (split_point + 1) * 16;
+        let dst = right + NODE_HEADER_SIZE;
+        let copy_bytes = (right_count - 1) * 16; // exclude last child, copy separately
+        if copy_bytes > 0 {
+            alloc::copy(dst, src, copy_bytes);
+        }
+        
+        // Copy last child pointer (at end of internal node's data area)
+        let last_child = internal_get_child(node_ptr, count);
+        internal_set_child(right, right_count - 1, last_child);
+    }
+    
+    node_write_i64(right, NODE_COUNT_OFF, right_count - 1);
+    if right_count > 1 {
+        set_low_key(right, internal_get_key(right, 0));
+        set_high_key(right, internal_get_key(right, right_count - 2));
+    }
+    
+    // Truncate left node
+    node_write_i64(node_ptr, NODE_COUNT_OFF, split_point);
+    if split_point > 0 {
+        set_high_key(node_ptr, internal_get_key(node_ptr, split_point - 1));
+    }
+    
+    (right, promoted_key)
+}
+
+/// Set the next leaf pointer (sibling chain)
+pub fn set_next_leaf(node_ptr: i64, next: i64) {
+    node_write_i64(node_ptr, NODE_NEXT_OFF, next);
+}
+
+/// Get the next leaf pointer
+pub fn get_next_leaf(node_ptr: i64) -> i64 {
+    node_read_i64(node_ptr, NODE_NEXT_OFF)
+}
+
+/// Set the previous leaf pointer
+pub fn set_prev_leaf(node_ptr: i64, prev: i64) {
+    node_write_i64(node_ptr, NODE_PREV_OFF, prev);
+}
+
+/// Get the previous leaf pointer
+pub fn get_prev_leaf(node_ptr: i64) -> i64 {
+    node_read_i64(node_ptr, NODE_PREV_OFF)
+}
+
+/// Link two leaves together in the sibling chain
+pub fn link_leaves(left: i64, right: i64) {
+    set_next_leaf(left, right);
+    set_prev_leaf(right, left);
+}
+
+/// Merge adjacent sibling into this leaf. Copies all entries from sibling,
+/// then links this leaf to sibling's next. Returns the merged sibling pointer
+/// so caller can free/reuse it.
+pub fn merge_leaf_into(left: i64, right: i64) {
+    let left_count = entry_count(left);
+    let right_count = entry_count(right);
+    
+    // Bulk-copy all entries from right into left (at end of left)
+    if right_count > 0 {
+        let src = right + NODE_HEADER_SIZE;
+        let dst = left + NODE_HEADER_SIZE + left_count * 16;
+        alloc::copy(dst, src, right_count * 16);
+    }
+    
+    // Update left's count and bounds
+    let new_count = left_count + right_count;
+    node_write_i64(left, NODE_COUNT_OFF, new_count);
+    if right_count > 0 {
+        set_high_key(left, leaf_get_key(right, right_count - 1));
+    }
+    
+    // Re-link sibling chain: left now points to right's next
+    let right_next = get_next_leaf(right);
+    set_next_leaf(left, right_next);
+    if right_next != 0 {
+        set_prev_leaf(right_next, left);
+    }
+}
+
+/// Check if a leaf is marked as incompressible (zstd saved <5% last time)
+pub fn is_no_compress(node_ptr: i64) -> bool {
+    (node_read_i64(node_ptr, NODE_FLAGS_OFF) & NODE_NO_COMPRESS) != 0
+}
+
+/// Set or clear the no-compress flag
+pub fn set_no_compress(node_ptr: i64, val: bool) {
+    let flags = node_read_i64(node_ptr, NODE_FLAGS_OFF);
+    if val {
+        node_write_i64(node_ptr, NODE_FLAGS_OFF, flags | NODE_NO_COMPRESS);
+    } else {
+        node_write_i64(node_ptr, NODE_FLAGS_OFF, flags & !NODE_NO_COMPRESS);
+    }
+}
+
+/// Check if a leaf should be compacted (merged with a sibling)
+pub fn should_compact(node_ptr: i64, depth: i64) -> bool {
+    if depth == 0 { return false; }
+    entry_count(node_ptr) < MIN_PAIRS
+}
+
+/// Remove child and separator at index from an internal node
+/// Shifts remaining entries left via memcpy
+pub fn internal_remove_child(node_ptr: i64, index: i64) {
+    let count = entry_count(node_ptr);
+    
+    if index + 1 < count {
+        // Shift separator keys left
+        let key_src = node_ptr + NODE_HEADER_SIZE + (index + 1) * 16;
+        let key_dst = node_ptr + NODE_HEADER_SIZE + index * 16;
+        let shift_count = count - index - 1;
+        alloc::copy(key_dst, key_src, shift_count * 16);
+    }
+    
+    // Shift last child pointer left as well
+    if index <= count {
+        // The last child pointer is at base + count*16
+        // We need to move all child pointers from index+1 to count left by one
+        // But the current layout stores child[i] alongside sep[i]
+        // Actually, for internal nodes: sep[i] at base+i*16, child[i] at base+i*16+8
+        // and child[count] at base+count*16+8 (extra child after last sep)
+        // 
+        // The remove operation: remove sep[index] and child[index+1]
+        // Shift everything after index+1 left
+        // First, single-child-pointer shift for the last child slot
+        let last_child_src = node_ptr + NODE_HEADER_SIZE + count * 16 + 8;
+        let last_child_dst = node_ptr + NODE_HEADER_SIZE + (count - 1) * 16 + 8;
+        // This is just the last child pointer, 8 bytes
+        unsafe {
+            let last_val = *((last_child_src) as *const i64);
+            *(last_child_dst as *mut i64) = last_val;
+        }
+    }
+    
+    node_write_i64(node_ptr, NODE_COUNT_OFF, count - 1);
+    
+    // Update bounds
+    if count - 1 > 0 {
+        set_high_key(node_ptr, internal_get_key(node_ptr, count - 2));
+    }
+}
+
+/// Merge two adjacent internal nodes via a separator from the parent
+/// left and right are children of parent, separated by parent_sep at index
+/// parent_sep is the separator key in the parent between left and right
+pub fn internal_merge(node_ptr: i64, right: i64, parent_sep: i64) {
+    let left_count = entry_count(node_ptr);
+    let right_count = entry_count(right);
+    
+    // First add the separator key from parent into left, followed by right's entries
+    let insert_pos = left_count;
+    
+    // Write parent separator
+    internal_set_key(node_ptr, insert_pos, parent_sep);
+    // Copy right's first child pointer into the slot after parent_sep
+    internal_set_child(node_ptr, insert_pos, internal_get_child(right, 0));
+    
+    // Now shift right's entries to make room
+    if right_count > 0 {
+        // Copy the key+child pairs from right starting at its first key
+        let src = right + NODE_HEADER_SIZE + 0 * 16; // right's first entry
+        let dst = node_ptr + NODE_HEADER_SIZE + (insert_pos + 1) * 16;
+        let copy_bytes = right_count * 16;
+        alloc::copy(dst, src, copy_bytes);
+        
+        // Copy right's last child pointer too
+        let right_last_child = internal_get_child(right, right_count);
+        internal_set_child(node_ptr, left_count + 1 + right_count, right_last_child);
+    } else {
+        // If right is empty, just copy its last child
+        let right_child = internal_get_child(right, 0);
+        internal_set_child(node_ptr, insert_pos + 1, right_child);
+    }
+    
+    let new_count = left_count + 1 + right_count;
+    node_write_i64(node_ptr, NODE_COUNT_OFF, new_count);
+    set_high_key(node_ptr, internal_get_key(node_ptr, new_count - 1));
+}
+
+/// Check if an internal node should be merged
+pub fn internal_should_merge(node_ptr: i64, depth: i64) -> bool {
+    if depth == 0 { return false; }
+    entry_count(node_ptr) < (MAX_KEYS / 4)
+}
+
+/// Compute the size of a node's data for serialization
+pub fn node_data_size(node_ptr: i64) -> i64 {
+    let count = entry_count(node_ptr);
+    if is_leaf(node_ptr) {
+        NODE_HEADER_SIZE + count * 16  // key + value per pair
+    } else {
+        NODE_HEADER_SIZE + count * 16 + 8 // + last child pointer
+    }
+}

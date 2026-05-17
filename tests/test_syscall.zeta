@@ -1,0 +1,9 @@
+// Test: Zeta syscall built-in
+// Calls SYS_write (1) to write "Hello from pure Zeta!\n" to stdout
+
+fn main() -> i64 {
+    let msg = "Hello from pure Zeta!\n";
+    // syscall(number, fd, buf, count)
+    let result = syscall(1, 1, msg, 19);
+    return result;  // Should return 19
+}

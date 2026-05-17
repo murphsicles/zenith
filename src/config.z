@@ -1,0 +1,160 @@
+// Zenith configuration module
+// Ported from sled::config with Zeta-native tuning
+
+pub struct Config {
+    /// Path to the database directory
+    path: string,
+    
+    /// Cache size in bytes (default: 64MB)
+    cache_size: i64,
+    
+    /// Percentage of cache reserved for scan-once entries (default: 20)
+    cache_scan_percent: i64,
+    
+    /// Zstd compression level (0 = disabled, default: 3)
+    compression_level: i64,
+    
+    /// B+ tree leaf fanout (default: 1024)
+    leaf_fanout: i64,
+    
+    /// Flush period in milliseconds (0 = no periodic flush, default: 1000)
+    flush_period_ms: i64,
+    
+    /// Whether to use direct I/O (default: false)
+    direct_io: bool,
+    
+    /// Whether to create the database if it doesn't exist (default: true)
+    create_if_missing: bool,
+    
+    /// Whether to run temporary (in-memory only, default: false)
+    temporary: bool,
+}
+
+impl Config {
+    /// Create a new default configuration
+    pub fn new() -> Config {
+        Config {
+            path: "",
+            cache_size: 64 * 1024 * 1024,     // 64 MB
+            cache_scan_percent: 20,
+            compression_level: 3,
+            leaf_fanout: 1024,
+            flush_period_ms: 1000,
+            direct_io: false,
+            create_if_missing: true,
+            temporary: false,
+        }
+    }
+    
+    /// Set the database path
+    pub fn path(mut self, path: string) -> Config {
+        self.path = path;
+        self
+    }
+    
+    /// Set the cache size
+    pub fn cache_size(mut self, bytes: i64) -> Config {
+        self.cache_size = bytes;
+        self
+    }
+    
+    /// Set the percentage of cache for scan-once entries (0-100)
+    pub fn cache_scan_percent(mut self, percent: i64) -> Config {
+        if percent < 0 { percent = 0; }
+        if percent > 100 { percent = 100; }
+        self.cache_scan_percent = percent;
+        self
+    }
+    
+    /// Set the zstd compression level (0 = disabled)
+    pub fn compression_level(mut self, level: i64) -> Config {
+        self.compression_level = level;
+        self
+    }
+    
+    /// Set the B+ tree leaf fanout
+    pub fn leaf_fanout(mut self, fanout: i64) -> Config {
+        self.leaf_fanout = fanout;
+        self
+    }
+    
+    /// Set the flush period in milliseconds (0 = no automatic flush)
+    pub fn flush_period_ms(mut self, ms: i64) -> Config {
+        self.flush_period_ms = ms;
+        self
+    }
+    
+    /// Enable or disable direct I/O
+    pub fn direct_io(mut self, enabled: bool) -> Config {
+        self.direct_io = enabled;
+        self
+    }
+    
+    /// Set whether to create the database if it doesn't exist
+    pub fn create_if_missing(mut self, create: bool) -> Config {
+        self.create_if_missing = create;
+        self
+    }
+    
+    /// Set the database to be temporary (in-memory only)
+    pub fn temporary(mut self, temp: bool) -> Config {
+        self.temporary = temp;
+        self
+    }
+    
+    /// Get the database path
+    pub fn get_path(&self) -> string {
+        self.path
+    }
+    
+    /// Get the cache size
+    pub fn get_cache_size(&self) -> i64 {
+        self.cache_size
+    }
+    
+    /// Get the scan-once cache percentage
+    pub fn get_cache_scan_percent(&self) -> i64 {
+        self.cache_scan_percent
+    }
+    
+    /// Get the compression level
+    pub fn get_compression_level(&self) -> i64 {
+        self.compression_level
+    }
+    
+    /// Get the leaf fanout (compile-time evaluable)
+    pub comptime fn get_leaf_fanout(&self) -> i64 {
+        self.leaf_fanout
+    }
+    
+    /// Validate configuration, returning an error if invalid
+    pub fn validate(&self) -> core::result::Result<(), Error> {
+        if !self.temporary && self.path.len() == 0 {
+            return Error::InvalidConfig;
+        }
+        if self.cache_size < 1024 * 1024 {
+            return Error::InvalidConfig;
+        }
+        if self.leaf_fanout < 16 {
+            return Error::InvalidConfig;
+        }
+        if self.cache_scan_percent < 0 || self.cache_scan_percent > 100 {
+            return Error::InvalidConfig;
+        }
+        return Ok(());
+    }
+}
+
+// Compile-time default config verification
+comptime fn verify_default_config() {
+    let config = Config::new();
+    if config.cache_size != 64 * 1024 * 1024 {
+        panic("Default cache size mismatch");
+    }
+    if config.leaf_fanout != 1024 {
+        panic("Default leaf fanout mismatch");
+    }
+    if config.cache_scan_percent != 20 {
+        panic("Default cache scan percent mismatch");
+    }
+}

@@ -1,0 +1,639 @@
+// Zenith B+ tree — lock-free concurrent index with arena allocation
+// Hot key cache catches the 80/20 access pattern before any tree traversal
+// Most workloads are skewed: 80% of accesses hit 20% of keys
+
+const HOT_CACHE_SIZE: i64 = 64;  // 64 entries = 1KB, covers active working set
+const HOT_CACHE_MASK: i64 = 63;
+
+// Hot cache with valid bitmap — supports negative caching
+// Each entry: key[8] value[8] + 1 bit valid flag in a separate bitmap
+// Negative cache entries (known-absent keys) also reduce tree traversals
+
+pub struct HotCache {
+    entries: i64,   // Pointer to array of (key, value) pairs — 16 bytes each
+    valid_bits: i64, // Pointer to bitmap (8 bytes for 64 entries)
+}
+
+impl HotCache {
+    pub fn new() -> HotCache {
+        let entries_ptr = alloc::alloc_zero(HOT_CACHE_SIZE, 16);
+        let bits_ptr = alloc::alloc_zero(1, 8); // 64 bits
+        HotCache {
+            entries: entries_ptr,
+            valid_bits: bits_ptr,
+        }
+    }
+    
+    fn hash(key: i64) -> i64 {
+        // Thomas Wang integer hash (64-to-8-bit)
+        let mut h: u64 = key as u64;
+        h = (h ^ 61) ^ (h >> 16);
+        h = h + (h << 3);
+        h = h ^ (h >> 4);
+        h = h * 0x27D4EB2D;
+        h = h ^ (h >> 15);
+        (h & 0x3F as u64) as i64  // 6 bits → mask 63
+    }
+    
+    fn is_bit_set(&self, idx: i64) -> bool {
+        unsafe {
+            let byte_idx = idx >> 3;
+            let bit_idx = idx & 7;
+            let byte = *((self.valid_bits + byte_idx) as *const u8);
+            (byte & (1 << bit_idx)) != 0
+        }
+    }
+    
+    fn set_bit(&self, idx: i64) {
+        unsafe {
+            let byte_idx = idx >> 3;
+            let bit_idx = idx & 7;
+            let ptr = (self.valid_bits + byte_idx) as *mut u8;
+            *ptr = *ptr | (1 << bit_idx);
+        }
+    }
+    
+    fn clear_bit(&self, idx: i64) {
+        unsafe {
+            let byte_idx = idx >> 3;
+            let bit_idx = idx & 7;
+            let ptr = (self.valid_bits + byte_idx) as *mut u8;
+            *ptr = *ptr & !(1 << bit_idx);
+        }
+    }
+    
+    /// Lookup key. Returns value if found (even 0, if valid bit is set).
+    /// Returns a tuple: (value, found_in_cache)
+    pub fn lookup(&self, key: i64) -> (i64, bool) {
+        let idx = HotCache::hash(key);
+        if !self.is_bit_set(idx) {
+            return (0, false);
+        }
+        let entry = self.entries + idx * 16;
+        unsafe {
+            let stored_key = *(entry as *const i64);
+            if stored_key == key {
+                return (*((entry + 8) as *const i64), true);
+            }
+        }
+        (0, false)
+    }
+    
+    /// Insert or update a hot cache entry
+    pub fn insert(&self, key: i64, value: i64) {
+        let idx = HotCache::hash(key);
+        let entry = self.entries + idx * 16;
+        unsafe {
+            *(entry as *mut i64) = key;
+            *((entry + 8) as *mut i64) = value;
+        }
+        self.set_bit(idx);
+    }
+    
+    /// Invalidate (for delete)
+    pub fn invalidate(&self, key: i64) {
+        let idx = HotCache::hash(key);
+        let entry = self.entries + idx * 16;
+        unsafe {
+            let stored_key = *(entry as *const i64);
+            if stored_key == key {
+                self.clear_bit(idx);
+            }
+        }
+    }
+}
+
+pub struct Tree {
+    root_ptr: i64,              // Heap-allocated root pointer for atomic swap
+    config: *const Config,       // Pointer to the owning Db's config
+    id: i64,                    // Tree ID within the database
+    cache: i64,                 // Opaque pointer to LruCache
+    arena: *mut Arena,          // Arena allocator for node allocations
+    hot_cache: HotCache,        // 64-entry hot key cache (covers skewed access)
+    
+    // Append fast-path: monotonically increasing key hint
+    // For time-series, auto-increment, and sequential bulk load
+    // Skips binary search entirely when key > last seen
+    last_key: i64,              // Last inserted key
+    last_leaf: i64,             // Hint to the rightmost leaf (0 = unknown)
+}
+
+impl Tree {
+    pub fn new(config: *const Config, id: i64, arena: *mut Arena) -> Tree {
+        let arena_ref = unsafe { &mut *arena };
+        let root = node::alloc_node(arena_ref);
+        let root_ptr = alloc::alloc(8);
+        unsafe { *(root_ptr as *mut i64) = root; }
+        
+        let cache = LruCache::new(config.get_cache_size());
+        
+        Tree {
+            root_ptr: root_ptr,
+            config: config,
+            id: id,
+            cache: cache,
+            arena: arena,
+            hot_cache: HotCache::new(),
+            last_key: 0,
+            last_leaf: 0,
+    }
+    
+    fn get_arena(&self) -> &mut Arena {
+        unsafe { &mut *(self.arena as *mut Arena) }
+    }
+    
+    fn get_root(&self) -> i64 {
+        unsafe { *(self.root_ptr as *const i64) }
+    }
+    
+    fn swap_root(&self, new_root: i64) {
+        unsafe { *(self.root_ptr as *mut i64) = new_root; }
+    }
+    
+    /// Insert a key-value pair into the tree
+    pub fn insert(&self, key: i64, value: i64) {
+        let arena = self.get_arena();
+        
+        // Seed the hot cache
+        self.hot_cache.insert(key, value);
+        
+        // Append fast-path: monotonically increasing keys skip binary search
+        // This catches time-series, auto-increment, and bulk load patterns
+        // where keys arrive in sorted order
+        if key > self.last_key && self.last_leaf != 0 {
+            let count = node::entry_count(self.last_leaf);
+            if count < node::MAX_PAIRS {
+                // Append directly to the rightmost leaf — no search needed
+                node::leaf_insert_pair(self.last_leaf, count, key, value);
+                node::set_dirty(self.last_leaf, true);
+                self.last_key = key;
+                return;
+            } // else: leaf is full, fall through to normal insert (will split)
+        }
+        
+        loop {
+            let root = self.get_root();
+            if node::is_leaf(root) {
+                let (index, found) = node::leaf_find_key(root, key);
+                let count = node::entry_count(root);
+                
+                if found {
+                    node::leaf_set_pair(root, index, key, value);
+                    node::set_dirty(root, true);
+                    self.last_key = key;
+                    self.last_leaf = root;
+                    return;
+                }
+                
+                if count < node::MAX_PAIRS {
+                    node::leaf_insert_pair(root, index, key, value);
+                    node::set_dirty(root, true);
+                    self.last_key = key;
+                    self.last_leaf = root;
+                    return;
+                }
+                
+                // Leaf full — split, promoting to internal root
+                let right = node::leaf_split(root, arena);
+                let promoted_key = node::low_key(right);
+                
+                let new_root = node::alloc_internal_node(arena);
+                node::internal_set_child(new_root, 0, root);
+                node::internal_set_key(new_root, 0, promoted_key);
+                node::internal_set_child(new_root, 1, right);
+                node::write_i64(new_root, node::NODE_COUNT_OFF, 1);
+                node::set_low_key(new_root, node::low_key(root));
+                node::set_high_key(new_root, node::high_key(right));
+                
+                if key < promoted_key {
+                    node::leaf_insert_pair(root, index, key, value);
+                } else {
+                    let (r_idx, _) = node::leaf_find_key(right, key);
+                    node::leaf_insert_pair(right, r_idx, key, value);
+                }
+                
+                node::set_dirty(root, true);
+                node::set_dirty(right, true);
+                self.swap_root(new_root);
+                return;
+            } else {
+                // Descend into internal node tree
+                let split = self.insert_internal(root, key, value, arena);
+                if split != 0 {
+                    let (right, promoted) = node::internal_split(root, arena);
+                    let new_root = node::alloc_internal_node(arena);
+                    node::internal_set_child(new_root, 0, root);
+                    node::internal_set_key(new_root, 0, promoted);
+                    node::internal_set_child(new_root, 1, right);
+                    node::write_i64(new_root, node::NODE_COUNT_OFF, 1);
+                    node::set_low_key(new_root, node::low_key(root));
+                    node::set_high_key(new_root, node::high_key(right));
+                    
+                    if key < promoted {
+                        self.insert_internal(root, key, value, arena);
+                    } else {
+                        self.insert_internal(right, key, value, arena);
+                    }
+                    
+                    self.swap_root(new_root);
+                }
+                return;
+            }
+        }
+    }
+    
+    /// Internal recursive insert with arena. Returns non-zero if split occurred.
+    fn insert_internal(&self, node_ptr: i64, key: i64, value: i64, arena: &mut Arena) -> i64 {
+        let child_idx = node::internal_find_child(node_ptr, key);
+        let child = node::internal_get_child(node_ptr, child_idx);
+        
+        if node::is_leaf(child) {
+            let (index, found) = node::leaf_find_key(child, key);
+            let count = node::entry_count(child);
+            
+            if found {
+                node::leaf_set_pair(child, index, key, value);
+                node::set_dirty(child, true);
+                return 0;
+            }
+            
+            if count < node::MAX_PAIRS {
+                node::leaf_insert_pair(child, index, key, value);
+                node::set_dirty(child, true);
+                node::set_dirty(node_ptr, true);
+                return 0;
+            }
+            
+            // Split leaf, promote key to parent
+            let right = node::leaf_split(child, arena);
+            let promoted_key = node::low_key(right);
+            
+            if key < promoted_key {
+                node::leaf_insert_pair(child, index, key, value);
+            } else {
+                let (r_idx, _) = node::leaf_find_key(right, key);
+                node::leaf_insert_pair(right, r_idx, key, value);
+            }
+            
+            // Insert promoted entry into parent using memcpy (single bulk shift)
+            let pc = node::entry_count(node_ptr);
+            let shift_count = pc - child_idx;
+            if shift_count > 0 {
+                let src = node_ptr + node::NODE_HEADER_SIZE + child_idx * 16;
+                let dst = node_ptr + node::NODE_HEADER_SIZE + (child_idx + 1) * 16;
+                alloc::copy(dst, src, shift_count * 16);
+            }
+            node::internal_set_key(node_ptr, child_idx, promoted_key);
+            node::internal_set_child(node_ptr, child_idx + 1, right);
+            node::write_i64(node_ptr, node::NODE_COUNT_OFF, pc + 1);
+            
+            node::set_dirty(child, true);
+            node::set_dirty(right, true);
+            node::set_dirty(node_ptr, true);
+            
+            return if pc + 1 >= node::MAX_KEYS { 1 } else { 0 };
+        } else {
+            let split = self.insert_internal(child, key, value, arena);
+            if split != 0 {
+                let (s_right, s_promoted) = node::internal_split(child, arena);
+                let pc = node::entry_count(node_ptr);
+                let shift_count = pc - child_idx;
+                if shift_count > 0 {
+                    let src = node_ptr + node::NODE_HEADER_SIZE + child_idx * 16;
+                    let dst = node_ptr + node::NODE_HEADER_SIZE + (child_idx + 1) * 16;
+                    alloc::copy(dst, src, shift_count * 16);
+                }
+                node::internal_set_key(node_ptr, child_idx, s_promoted);
+                node::internal_set_child(node_ptr, child_idx + 1, s_right);
+                node::write_i64(node_ptr, node::NODE_COUNT_OFF, pc + 1);
+                node::set_dirty(node_ptr, true);
+                
+                return if pc + 1 >= node::MAX_KEYS { 1 } else { 0 };
+            }
+            return 0;
+        }
+    }
+    
+    /// Get a value by key, returning 0 if not found
+    /// Fast path: hot cache check before any tree traversal
+    /// Negative caching: repeated misses skip tree navigation entirely
+    pub fn get(&self, key: i64) -> i64 {
+        // Hot cache fast path
+        let (cached_val, cached_hit) = self.hot_cache.lookup(key);
+        if cached_hit {
+            return cached_val;  // Could be 0 (known absent or counter at 0)
+        }
+        
+        // Cache miss — fall through to tree traversal
+        let root = self.get_root();
+        let mut node = root;
+        
+        while !node::is_leaf(node) {
+            let child_idx = node::internal_find_child(node, key);
+            node = node::internal_get_child(node, child_idx);
+            if node == 0 { return 0; }
+        }
+        
+        let (index, found) = node::leaf_find_key(node, key);
+        if found {
+            let value = node::leaf_get_value(node, index);
+            self.hot_cache.insert(key, value);
+            return value;
+        }
+        
+        // Negative cache: key absent — cache it so next miss is instant
+        self.hot_cache.insert(key, 0);
+        return 0;
+    }
+    
+    /// Delete a key from the tree
+    pub fn delete(&self, key: i64) -> bool {
+        // Invalidate hot cache immediately
+        self.hot_cache.invalidate(key);
+        
+        let root = self.get_root();
+        let mut node = root;
+        let mut ancestors: [i64; 32] = [0; 32];
+        let mut depths: [i64; 32] = [0; 32];
+        let mut depth: i64 = 0;
+        
+        while !node::is_leaf(node) {
+            let child_idx = node::internal_find_child(node, key);
+            ancestors[depth as usize] = node;
+            depths[depth as usize] = child_idx;
+            depth += 1;
+            node = node::internal_get_child(node, child_idx);
+            if node == 0 { return false; }
+        }
+        
+        let (index, found) = node::leaf_find_key(node, key);
+        if !found { return false; }
+        
+        node::leaf_remove_pair(node, index);
+        node::set_dirty(node, true);
+        
+        // Flag underfull leaves for compaction during the next flush
+        if node::should_compact(node, depth) {
+            node::set_dirty(node, true);
+        }
+        
+        return true;
+    }
+    
+    /// Scan forward from start_key, walking the sibling chain
+    /// Uses predictive prefetch: touches the next leaf's first cache line
+    /// while still processing the current leaf
+    pub fn scan(&self, start_key: i64, out_keys: i64, out_values: i64, max_count: i64) -> i64 {
+        let root = self.get_root();
+        let mut node = root;
+        
+        while !node::is_leaf(node) {
+            let child_idx = node::internal_find_child(node, start_key);
+            node = node::internal_get_child(node, child_idx);
+            if node == 0 { return 0; }
+        }
+        
+        let (start_idx, _) = node::leaf_find_key(node, start_key);
+        let mut count: i64 = 0;
+        let mut current = node;
+        let mut idx = start_idx;
+        
+        while count < max_count && current != 0 {
+            // Predictive prefetch: touch the next leaf's first cache line
+            // This starts the memory load while we still process the current leaf
+            let next = node::get_next_leaf(current);
+            if next != 0 {
+                // Read the first 64 bytes (cache line) of the next leaf
+                unsafe {
+                    let _prefetch = *((next + 0) as *const i64);
+                    let _prefetch2 = *((next + 8) as *const i64);
+                    let _prefetch3 = *((next + 16) as *const i64);
+                    let _prefetch4 = *((next + 24) as *const i64);
+                    let _prefetch5 = *((next + 32) as *const i64);
+                    let _prefetch6 = *((next + 40) as *const i64);
+                    let _prefetch7 = *((next + 48) as *const i64);
+                    let _prefetch8 = *((next + 56) as *const i64);
+                }
+            }
+            
+            let num = node::entry_count(current);
+            while idx < num && count < max_count {
+                let k = node::leaf_get_key(current, idx);
+                let v = node::leaf_get_value(current, idx);
+                if out_keys != 0 {
+                    unsafe { *((out_keys + count * 8) as *mut i64) = k; }
+                }
+                if out_values != 0 {
+                    unsafe { *((out_values + count * 8) as *mut i64) = v; }
+                }
+                count += 1;
+                idx += 1;
+            }
+            
+            // Advance to next leaf
+            current = next;
+            idx = 0;
+        }
+        
+        count
+    }
+    
+    /// Find the parent internal node and child index for a given leaf node.
+    /// Traverses from root, storing the descent path in out_ancestors and out_depths.
+    /// Returns the immediate parent pointer and the index of `target` in that parent.
+    fn find_parent(
+        &self,
+        target: i64,
+        out_ancestors: &mut [i64; 32],
+        out_depths: &mut [i64; 32],
+    ) -> (i64, i64) {
+        let root = self.get_root();
+        if node::is_leaf(root) {
+            return (0, 0);  // No parent — root is leaf
+        }
+        
+        let mut node = root;
+        let mut depth: i64 = 0;
+        
+        loop {
+            let count = node::entry_count(node);
+            let mut found: bool = false;
+            let mut i: i64 = 0;
+            while i <= count {
+                let child = node::internal_get_child(node, i);
+                if child == target {
+                    out_ancestors[depth as usize] = node;
+                    out_depths[depth as usize] = i;
+                    return (node, i);
+                }
+                if node::is_leaf(child) {
+                    i += 1;
+                    continue;
+                }
+                // Check if target is in child's subtree via key range
+                let low_k = node::low_key(target);
+                let high_k = node::high_key(target);
+                if i == 0 || low_k > node::internal_get_key(node, i - 1) {
+                    if i >= count || high_k <= node::internal_get_key(node, i) {
+                        out_ancestors[depth as usize] = node;
+                        out_depths[depth as usize] = i;
+                        node = child;
+                        depth += 1;
+                        found = true;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            if !found || node == target || node::is_leaf(node) {
+                return (node, 0);
+            }
+        }
+    }
+    
+    /// Recursively merge underfull internal nodes up the tree.
+    /// Called after a leaf merge removed a child from `parent_at_depth`.
+    /// Returns non-zero if the root itself was merged (tree shrinks).
+    fn merge_internal_up(
+        &self,
+        parent_ptr: i64,
+        parent_depth: i64,
+        ancestors: &[i64; 32],
+        depths: &[i64; 32],
+        arena: &mut Arena,
+    ) -> i64 {
+        let count = node::entry_count(parent_ptr);
+        if count >= node::MAX_KEYS / 4 || parent_depth == 0 {
+            return 0;  // Not underfull or at root
+        }
+        
+        // Find where this node is in its parent
+        if parent_depth <= 0 { return 0; }
+        let grandparent = ancestors[(parent_depth - 1) as usize];
+        let parent_idx = depths[(parent_depth - 1) as usize];
+        
+        let gp_count = node::entry_count(grandparent);
+        
+        // Try to merge with left sibling first
+        if parent_idx > 0 {
+            let left_sib = node::internal_get_child(grandparent, parent_idx - 1);
+            let left_count = node::entry_count(left_sib);
+            let right_count = count;
+            
+            // +1 for the separator between them
+            if left_count + 1 + right_count <= node::MAX_KEYS {
+                // Get separator from grandparent
+                let sep = node::internal_get_key(grandparent, parent_idx - 1);
+                node::internal_merge(left_sib, parent_ptr, sep);
+                node::set_dirty(left_sib, true);
+                
+                // Remove separator and child from grandparent
+                node::internal_remove_child(grandparent, parent_idx - 1);
+                node::set_dirty(grandparent, true);
+                
+                // Update root if grandparent becomes empty
+                if node::entry_count(grandparent) == 0 && parent_depth - 1 == 0 {
+                    self.swap_root(left_sib);
+                    return 1;
+                }
+                
+                // Recursively check grandparent
+                return self.merge_internal_up(
+                    grandparent, parent_depth - 1, ancestors, depths, arena
+                );
+            }
+        }
+        
+        // Try right sibling
+        if parent_idx < gp_count {
+            let right_sib = node::internal_get_child(grandparent, parent_idx + 1);
+            let left_count = count;
+            let right_count = node::entry_count(right_sib);
+            
+            if left_count + 1 + right_count <= node::MAX_KEYS {
+                let sep = node::internal_get_key(grandparent, parent_idx);
+                node::internal_merge(parent_ptr, right_sib, sep);
+                node::set_dirty(parent_ptr, true);
+                
+                // Remove separator and right child from grandparent
+                node::internal_remove_child(grandparent, parent_idx);
+                node::set_dirty(grandparent, true);
+                
+                if node::entry_count(grandparent) == 0 && parent_depth - 1 == 0 {
+                    self.swap_root(parent_ptr);
+                    return 1;
+                }
+                
+                return self.merge_internal_up(
+                    grandparent, parent_depth - 1, ancestors, depths, arena
+                );
+            }
+        }
+        
+        0
+    }
+    
+    /// Compact underfull leaves: walk sibling chain, merge adjacent pairs
+    /// that fit together in one page. After merging, cleans up the parent
+    /// internal nodes and recursively merges underfull parents.
+    /// Called before flush.
+    pub fn compact(&self) -> i64 {
+        let root = self.get_root();
+        let mut node = root;
+        let arena = self.get_arena();
+        
+        // Descend to first leaf
+        while !node::is_leaf(node) {
+            let child = node::internal_get_child(node, 0);
+            if child == 0 { return 0; }
+            node = child;
+        }
+        
+        let mut merged: i64 = 0;
+        let mut left = node;
+        
+        loop {
+            let right = node::get_next_leaf(left);
+            if right == 0 { break; }
+            
+            let left_count = node::entry_count(left);
+            let right_count = node::entry_count(right);
+            
+            if left_count + right_count <= node::MAX_PAIRS {
+                // Find parent of `right` in the internal tree
+                let mut ancestors: [i64; 32] = [0; 32];
+                let mut depths: [i64; 32] = [0; 32];
+                let (parent, child_idx) = self.find_parent(right, &mut ancestors, &mut depths);
+                
+                // Merge leaf data: right into left
+                node::merge_leaf_into(left, right);
+                node::set_dirty(left, true);
+                
+                // Remove the separator for `right` from the parent
+                if parent != 0 {
+                    // The right leaf is at child_idx in the parent
+                    // (it was found as child[child_idx])
+                    // We need to remove sep[child_idx-1] and child[child_idx]
+                    if child_idx > 0 {
+                        node::internal_remove_child(parent, child_idx - 1);
+                        node::set_dirty(parent, true);
+                        
+                        // Recursively merge underfull parents
+                        let parent_depth = 1; // Immediate parent depth
+                        self.merge_internal_up(
+                            parent, parent_depth, &ancestors, &depths, arena
+                        );
+                    }
+                }
+                
+                merged += 1;
+                // Don't advance left — the merged leaf is now larger
+                // and may be viable for further merging
+            } else {
+                left = right;
+            }
+        }
+        
+        merged
+    }
+}

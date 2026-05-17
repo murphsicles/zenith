@@ -1,0 +1,114 @@
+// Zenith lock-free stack (Treiber stack)
+// Used by the EBR system for deferred reclamation
+
+extern fn __sync_val_compare_and_swap(ptr: i64, old: i64, new: i64) -> i64;
+extern fn __sync_synchronize();
+
+pub struct Node {
+    next: i64,
+    data: i64,
+    epoch: i64,
+}
+
+pub struct Stack {
+    head_ptr: i64,    // Pointer to the head Node pointer (8 bytes)
+}
+
+impl Stack {
+    pub fn new() -> Stack {
+        let ptr = alloc::alloc(8);
+        alloc::zero(ptr, 8);
+        Stack { head_ptr: ptr }
+    }
+    
+    fn load_head(&self) -> i64 {
+        unsafe { *(self.head_ptr as *const i64) }
+    }
+    
+    pub fn push(&self, data: i64, epoch: i64) {
+        let node_ptr = alloc::alloc(24); // 3 x i64
+        unsafe {
+            *(node_ptr as *mut i64) = 0;         // next = null
+            *((node_ptr + 8) as *mut i64) = data;
+            *((node_ptr + 16) as *mut i64) = epoch;
+            
+            loop {
+                let current = self.load_head();
+                *(node_ptr as *mut i64) = current;
+                
+                let prev = __sync_val_compare_and_swap(
+                    self.head_ptr,
+                    current,
+                    node_ptr,
+                );
+                if prev == current {
+                    break;
+                }
+            }
+        }
+    }
+    
+    pub fn pop(&self) -> i64 {
+        unsafe {
+            loop {
+                let current = self.load_head();
+                if current == 0 {
+                    return 0;
+                }
+                let next = *(current as *const i64); // node.next
+                
+                let prev = __sync_val_compare_and_swap(
+                    self.head_ptr,
+                    current,
+                    next,
+                );
+                if prev == current {
+                    let data = *((current + 8) as *const i64);
+                    alloc::dealloc(current);
+                    return data;
+                }
+            }
+        }
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.load_head() == 0
+    }
+    
+    /// Drain all items, collecting their data values into an array
+    pub fn drain_all(&self, out_array: i64) -> i64 {
+        let mut count: i64 = 0;
+        loop {
+            let data = self.pop();
+            if data == 0 {
+                break;
+            }
+            if out_array != 0 {
+                unsafe {
+                    *((out_array + count * 8) as *mut i64) = data;
+                }
+            }
+            count += 1;
+        }
+        count
+    }
+}
+
+pub fn atomic_inc(ptr: i64) -> i64 {
+    extern fn __sync_fetch_and_add(ptr: i64, val: i64) -> i64;
+    unsafe { __sync_fetch_and_add(ptr, 1) }
+}
+
+pub fn atomic_dec(ptr: i64) -> i64 {
+    extern fn __sync_fetch_and_sub(ptr: i64, val: i64) -> i64;
+    unsafe { __sync_fetch_and_sub(ptr, 1) }
+}
+
+pub fn atomic_load(ptr: i64) -> i64 {
+    unsafe { *(ptr as *const i64) }
+}
+
+pub fn atomic_store(ptr: i64, val: i64) {
+    unsafe { *(ptr as *mut i64) = val; }
+    __sync_synchronize();
+}

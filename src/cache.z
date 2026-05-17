@@ -1,0 +1,161 @@
+// Zenith scan-resistant LRU cache
+// Clock-sweep eviction for scan resistance (sled-inspired)
+
+pub struct CacheEntry {
+    key_low: i64,       // Lowest key in cached leaf
+    leaf_ptr: i64,      // Pointer to leaf data (0 = empty)
+    leaf_size: i64,     // Size of leaf data
+    access_count: i64,  // Clock-sweep access counter
+}
+
+pub struct LruCache {
+    entries: i64,       // Pointer to CacheEntry array
+    capacity: i64,      // Number of entries
+    size: i64,          // Live entries
+    clock_hand: i64,    // Current sweep position
+}
+
+fn entry_size() -> i64 { 32 } // 4 x i64 fields
+
+impl LruCache {
+    pub fn new(capacity: i64) -> LruCache {
+        let ptr = alloc::alloc_zero(capacity, entry_size());
+        LruCache {
+            entries: ptr,
+            capacity: capacity,
+            size: 0,
+            clock_hand: 0,
+        }
+    }
+    
+    fn get_entry(&self, index: i64) -> CacheEntry {
+        unsafe {
+            let base = self.entries + index * entry_size();
+            CacheEntry {
+                key_low: *(base as *const i64),
+                leaf_ptr: *((base + 8) as *const i64),
+                leaf_size: *((base + 16) as *const i64),
+                access_count: *((base + 24) as *const i64),
+            }
+        }
+    }
+    
+    fn set_entry(&self, index: i64, entry: &CacheEntry) {
+        unsafe {
+            let base = self.entries + index * entry_size();
+            *(base as *mut i64) = entry.key_low;
+            *((base + 8) as *mut i64) = entry.leaf_ptr;
+            *((base + 16) as *mut i64) = entry.leaf_size;
+            *((base + 24) as *mut i64) = entry.access_count;
+        }
+    }
+    
+    pub fn get(&self, key_low: i64) -> i64 {
+        let mut i: i64 = 0;
+        while i < self.capacity {
+            let entry = self.get_entry(i);
+            if entry.key_low == key_low && entry.leaf_ptr != 0 {
+                // Bump access count
+                let mut updated = entry;
+                updated.access_count += 1;
+                self.set_entry(i, &updated);
+                return entry.leaf_ptr;
+            }
+            i += 1;
+        }
+        return 0;
+    }
+    
+    pub fn insert(&self, key_low: i64, leaf_ptr: i64, leaf_size: i64) {
+        // Update existing
+        let mut i: i64 = 0;
+        while i < self.capacity {
+            let entry = self.get_entry(i);
+            if entry.key_low == key_low && entry.leaf_ptr != 0 {
+                if entry.leaf_ptr != leaf_ptr {
+                    alloc::dealloc(entry.leaf_ptr);
+                }
+                let mut updated = entry;
+                updated.leaf_ptr = leaf_ptr;
+                updated.leaf_size = leaf_size;
+                updated.access_count += 1;
+                self.set_entry(i, &updated);
+                return;
+            }
+            i += 1;
+        }
+        
+        // Evict and insert
+        let slot = self.evict();
+        if slot >= 0 {
+            let entry = self.get_entry(slot);
+            if entry.leaf_ptr != 0 {
+                alloc::dealloc(entry.leaf_ptr);
+            }
+            let new_entry = CacheEntry {
+                key_low: key_low,
+                leaf_ptr: leaf_ptr,
+                leaf_size: leaf_size,
+                access_count: 1,
+            };
+            self.set_entry(slot, &new_entry);
+        }
+    }
+    
+    fn evict(&self) -> i64 {
+        let mut attempts: i64 = 0;
+        while attempts < self.capacity {
+            let hand = self.clock_hand;
+            self.clock_hand = (hand + 1) % self.capacity;
+            
+            let entry = self.get_entry(hand);
+            if entry.leaf_ptr == 0 {
+                return hand;
+            }
+            if entry.access_count > 0 {
+                let mut updated = entry;
+                updated.access_count -= 1;
+                self.set_entry(hand, &updated);
+                attempts += 1;
+                continue;
+            }
+            return hand;
+        }
+        let hand = self.clock_hand;
+        self.clock_hand = (hand + 1) % self.capacity;
+        hand
+    }
+    
+    pub fn remove(&self, key_low: i64) {
+        let mut i: i64 = 0;
+        while i < self.capacity {
+            let entry = self.get_entry(i);
+            if entry.key_low == key_low && entry.leaf_ptr != 0 {
+                alloc::dealloc(entry.leaf_ptr);
+                let empty = CacheEntry {
+                    key_low: 0, leaf_ptr: 0, leaf_size: 0, access_count: 0,
+                };
+                self.set_entry(i, &empty);
+                return;
+            }
+            i += 1;
+        }
+    }
+    
+    pub fn clear(&self) {
+        let mut i: i64 = 0;
+        while i < self.capacity {
+            let entry = self.get_entry(i);
+            if entry.leaf_ptr != 0 {
+                alloc::dealloc(entry.leaf_ptr);
+            }
+            let empty = CacheEntry {
+                key_low: 0, leaf_ptr: 0, leaf_size: 0, access_count: 0,
+            };
+            self.set_entry(i, &empty);
+            i += 1;
+        }
+        self.size = 0;
+        self.clock_hand = 0;
+    }
+}

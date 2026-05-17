@@ -1,0 +1,199 @@
+// Zenith test suite
+// Tests for the Zeta-native embedded database
+
+use zenith::{Config, Db};
+
+// Test 1: Basic open/close
+fn test_open_close() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    db.is_open()
+}
+
+// Test 2: Set and get a single key-value
+fn test_set_get() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    
+    tree.insert(42, 100);
+    let val = tree.get(42);
+    val == 100
+}
+
+// Test 3: Get nonexistent key
+fn test_get_missing() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    
+    let val = tree.get(999);
+    val == 0
+}
+
+// Test 4: Update existing key
+fn test_update() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    
+    tree.insert(42, 100);
+    tree.insert(42, 200);
+    let val = tree.get(42);
+    val == 200
+}
+
+// Test 5: Delete a key
+fn test_delete() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    
+    tree.insert(42, 100);
+    let deleted = tree.delete(42);
+    let val = tree.get(42);
+    
+    deleted && val == 0
+}
+
+// Test 6: Multiple keys
+fn test_multi_key() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    
+    tree.insert(10, 1);
+    tree.insert(20, 2);
+    tree.insert(30, 3);
+    tree.insert(5, 0);
+    tree.insert(15, 4);
+    tree.insert(25, 5);
+    
+    let t1 = tree.get(10) == 1;
+    let t2 = tree.get(20) == 2;
+    let t3 = tree.get(30) == 3;
+    let t4 = tree.get(5) == 0;
+    let t5 = tree.get(15) == 4;
+    let t6 = tree.get(25) == 5;
+    
+    t1 && t2 && t3 && t4 && t5 && t6
+}
+
+// Test 7: B+ tree node split (insert many keys to force splits)
+fn test_tree_split() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    
+    // Insert enough keys to force leaf splits and root splits
+    let mut i: i64 = 0;
+    while i < 1000 {
+        tree.insert(i, i * 2);
+        i += 1;
+    }
+    
+    // Verify all keys are retrievable
+    let mut ok: bool = true;
+    let mut j: i64 = 0;
+    while j < 1000 {
+        let val = tree.get(j);
+        if val != j * 2 {
+            ok = false;
+        }
+        j += 1;
+    }
+    
+    ok
+}
+
+// Test 8: Persistent database (file-backed)
+fn test_persistent() -> bool {
+    let path = "/tmp/zenith_test_" + timestamp();
+    let config = Config::new()
+        .path(path)
+        .create_if_missing(true);
+    
+    let db = Db::open(config);
+    db.set(1, 100);
+    db.set(2, 200);
+    db.flush();
+    
+    // Re-open
+    let db2 = Db::open(Config::new().path(path));
+    let v1 = db2.get(1);
+    let v2 = db2.get(2);
+    
+    // Cleanup
+    rmdir(path);
+    
+    v1 == 100 && v2 == 200
+}
+
+// Test 9: Config validation
+fn test_config_validation() -> bool {
+    let config = Config::new()
+        .path("/tmp/zenith_test")
+        .cache_size(64 * 1024 * 1024)
+        .compression_level(3)
+        .leaf_fanout(1024);
+    
+    let valid = config.validate();
+    valid
+}
+
+// Test 10: Size class computation (CTFE)
+fn test_size_classes() -> bool {
+    let s0 = zenith::heap::slot_size_for_class(0);
+    let s1 = zenith::heap::slot_size_for_class(1);
+    let s2 = zenith::heap::slot_size_for_class(2);
+    let idx_small = zenith::heap::size_class_index(64);
+    let idx_large = zenith::heap::size_class_index(4096);
+    
+    // Class 0 = 32, Class 1 ≈ 38, Class 2 ≈ 45
+    // 64 bytes → likely class 2 or 3
+    // 4096 bytes → much larger class
+    s0 == 32 && s1 > s0 && s2 > s1 && idx_small < idx_large
+}
+
+fn timestamp() -> i64 {
+    extern fn clock_gettime(clk_id: i64, tp: i64) -> i64;
+    0 // stub
+}
+
+extern fn rmdir(path: string) -> i64;
+
+fn main() -> i64 {
+    let tests: [fn() -> bool; 10] = [
+        test_open_close,
+        test_set_get,
+        test_get_missing,
+        test_update,
+        test_delete,
+        test_multi_key,
+        test_tree_split,
+        test_persistent,
+        test_config_validation,
+        test_size_classes,
+    ];
+    
+    let mut passed: i64 = 0;
+    let mut failed: i64 = 0;
+    
+    let mut i: i64 = 0;
+    while i < 10 {
+        let test = tests[i as usize];
+        if test() {
+            passed += 1;
+        } else {
+            failed += 1;
+        }
+        i += 1;
+    }
+    
+    println!("Zenith tests: {} passed, {} failed", passed, failed);
+    
+    if failed > 0 {
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,74 @@
+// Zenith lock-free MPSC queue
+// Multi-producer, single-consumer for flush work scheduling
+
+pub struct Queue {
+    head: i64,  // pointer to head sentinel node
+    tail: i64,  // pointer to tail node (single consumer writes)
+}
+
+pub struct QNode {
+    next: i64,
+    data: i64,
+}
+
+extern fn __sync_val_compare_and_swap(ptr: i64, old: i64, new: i64) -> i64;
+
+impl Queue {
+    pub fn new() -> Queue {
+        let sentinel = alloc::alloc(16);
+        unsafe {
+            *(sentinel as *mut i64) = 0;    // next = null
+            *((sentinel + 8) as *mut i64) = 0; // data = 0
+        }
+        Queue {
+            head: sentinel,
+            tail: sentinel,
+        }
+    }
+    
+    pub fn push(&self, data: i64) {
+        let node = alloc::alloc(16);
+        unsafe {
+            *(node as *mut i64) = 0;       // next = null
+            *((node + 8) as *mut i64) = data;
+        }
+        
+        loop {
+            let tail_ptr = unsafe { *(self.tail as *const i64) };
+            let actual_tail = if tail_ptr == 0 { self.tail } else { tail_ptr };
+            
+            let prev = __sync_val_compare_and_swap(
+                self.tail,
+                actual_tail,
+                node,
+            );
+            if prev == actual_tail {
+                unsafe {
+                    *(prev as *mut i64) = node; // set prev->next = node
+                }
+                break;
+            }
+        }
+    }
+    
+    pub fn pop(&self) -> i64 {
+        let head = self.head;
+        unsafe {
+            let next = *(head as *const i64);
+            if next == 0 {
+                return 0;
+            }
+            let data = *((next + 8) as *const i64);
+            self.head = next;
+            alloc::dealloc(head);
+            return data;
+        }
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        unsafe {
+            let next = *(self.head as *const i64);
+            next == 0
+        }
+    }
+}
