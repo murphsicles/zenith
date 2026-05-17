@@ -10,11 +10,9 @@ Zenith is a lock-free, transactional embedded database with:
 - Slab-based heap allocation (~20% size increments)
 - Epoch-based reclamation
 
-Architecture inspired by [sled](https://github.com/spacejam/sled), written Zeta-native.
-
 ## Status
 
-🚧 Early development — transpiling Sled's architecture into Zeta-idiomatic code.
+🚧 Active development. Core architecture complete with 14 performance optimizations. Compilation requires `zetac` v1.0.16+.
 
 ## Building
 
