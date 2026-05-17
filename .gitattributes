@@ -1,0 +1,6 @@
+# GitHub Linguist overrides for Zeta syntax highlighting
+# Zeta syntax closely resembles Rust — use Rust for highlighting
+*.zeta linguist-language=Rust
+
+# Treat the README's Zeta code blocks as Rust for highlighting
+*.md linguist-language=Markdown

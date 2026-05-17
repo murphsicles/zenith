@@ -4,7 +4,7 @@
 
 Zenith is a lock-free, transactional embedded database that redefines what's possible when a systems language doesn't need anything between it and the kernel.
 
-```zeta
+```rust
 // Pure Zeta. Raw syscalls. Nothing in the way. 🔥
 pub fn open(path: string, flags: i64, mode: i64) -> i64 {
     syscall(2, path, flags, mode)  // SYS_open
@@ -41,7 +41,7 @@ pub fn open(path: string, flags: i64, mode: i64) -> i64 {
 
 Size classes are computed **at compile time** and burned into a lookup table. Zero runtime math. Zero loops.
 
-```zeta
+```rust
 pub comptime fn slot_size_for_class(class_idx: i64) -> i64 { ... }
 const CLASS_SLOT_SIZES: [64]i64 = gen_slot_sizes();        // ✨ computed now
 const CLASS_UPPER_BOUNDS: [64]i64 = gen_class_upper_bounds();
@@ -138,7 +138,7 @@ Requires [Zeta](https://github.com/murphsicles/zeta) **v1.0.16+**.
 
 ## 📝 Usage
 
-```zeta
+```rust
 use zenith::{Db, Config};
 
 fn main() -> i64 {
