@@ -1,9 +1,5 @@
 # GitHub Linguist overrides for Zeta syntax highlighting
-# Zeta syntax closely resembles Rust — use Rust for highlighting
-*.zeta linguist-language=Rust
-
-# Treat the README's Zeta code blocks as Rust for highlighting
-*.md linguist-language=Markdown
-
-# Zeta source files (.z extension)
-*.z linguist-language=Rust
+# Zeta has its own TextMate grammar registered with Linguist
+*.z linguist-language=Zeta linguist-detectable=true
+*.zeta linguist-language=Zeta linguist-detectable=true
+zorb.toml linguist-language=TOML
