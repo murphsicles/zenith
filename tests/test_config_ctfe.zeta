@@ -1,0 +1,96 @@
+// Zenith config + CTFE tests
+use zenith::{Config, Db};
+
+fn test_config_valid() -> bool {
+    let c=Config::new().path("/tmp/z").cache_size(64*1024*1024).compression_level(3).leaf_fanout(1024);
+    if c.validate(){true}else{false}
+}
+fn test_config_empty_path() -> bool {
+    Config::new().path("").temporary(false).validate()==false
+}
+fn test_config_tiny_cache() -> bool {
+    Config::new().path("/tmp/z").cache_size(512).validate()==false
+}
+fn test_config_small_fanout() -> bool {
+    Config::new().path("/tmp/z").leaf_fanout(4).validate()==false
+}
+fn test_config_min_fanout() -> bool {
+    Config::new().path("/tmp/z").leaf_fanout(16).validate()
+}
+fn test_config_max_fanout() -> bool {
+    Config::new().path("/tmp/z").leaf_fanout(1024).validate()
+}
+fn test_config_no_compression() -> bool {
+    Config::new().path("/tmp/z").compression_level(0).validate()
+}
+fn test_config_cache_min() -> bool {
+    Config::new().path("/tmp/z").cache_size(1024*1024).validate()
+}
+fn test_hot_cache_repeat() -> bool {
+    let c=Config::new().temporary(true);let d=Db::open(c);let t=d.open_tree("default");
+    t.insert(42,100);
+    t.get(42)==100&&t.get(42)==100&&t.get(42)==100
+}
+fn test_hot_cache_negative() -> bool {
+    let c=Config::new().temporary(true);let d=Db::open(c);let t=d.open_tree("default");
+    t.get(999)==0&&t.get(999)==0&&t.get(999)==0
+}
+fn test_flush_temp() -> bool {
+    let c=Config::new().temporary(true);let d=Db::open(c);
+    d.set(1,100);let f=d.flush();f&&d.get(1)==100
+}
+fn test_flush_twice() -> bool {
+    let c=Config::new().temporary(true);let d=Db::open(c);
+    d.set(1,100);let f1=d.flush();let f2=d.flush();f1&&f2&&d.get(1)==100
+}
+fn test_ctfe_constants() -> bool {
+    zenith::heap::MIN_ALLOC==32&&zenith::heap::MAX_ALLOC==16*1024*1024&&zenith::heap::NUM_CLASSES==64
+}
+fn test_ctfe_slot_size() -> bool {
+    zenith::heap::slot_size_for_class(0)==32&&zenith::heap::slot_size_for_class(1)>32
+}
+fn test_ctfe_size_index() -> bool {
+    let s0=zenith::heap::size_class_index(32);
+    let s1=zenith::heap::size_class_index(64);
+    let s2=zenith::heap::size_class_index(1024);
+    s0>=0&&s1>s0&&s2>s1
+}
+fn test_ctfe_boundaries() -> bool {
+    zenith::heap::size_class_index(32)==0&&zenith::heap::size_class_index(33)>0
+}
+fn test_ctfe_monotonic() -> bool {
+    let s0=zenith::heap::slot_size_for_class(0);
+    let s10=zenith::heap::slot_size_for_class(10);
+    let s30=zenith::heap::slot_size_for_class(30);
+    let s63=zenith::heap::slot_size_for_class(63);
+    s63>s30&&s30>s10&&s10>s0
+}
+fn test_ctfe_first_class() -> bool {
+    zenith::heap::slot_size_for_class(0)==32
+    &&zenith::heap::size_class_index(32)==0
+    &&zenith::heap::size_class_index(31)==0
+}
+
+fn main() -> i64 {
+    let tests:[fn()->bool;18]=[
+        test_config_valid,test_config_empty_path,test_config_tiny_cache,test_config_small_fanout,
+        test_config_min_fanout,test_config_max_fanout,test_config_no_compression,test_config_cache_min,
+        test_hot_cache_repeat,test_hot_cache_negative,test_flush_temp,test_flush_twice,
+        test_ctfe_constants,test_ctfe_slot_size,test_ctfe_size_index,test_ctfe_boundaries,
+        test_ctfe_monotonic,test_ctfe_first_class,
+    ];
+    let names:[string;18]=[
+        "config_valid","config_empty_path","config_tiny_cache","config_small_fanout",
+        "config_min_fanout","config_max_fanout","config_no_comp","config_cache_min",
+        "hot_cache_repeat","hot_cache_neg","flush_temp","flush_twice",
+        "ctfe_constants","ctfe_slot_size","ctfe_size_index","ctfe_boundaries",
+        "ctfe_monotonic","ctfe_first_class",
+    ];
+    let mut passed=0;let mut failed=0;let mut i=0;
+    while i<18{
+        if tests[i as usize](){passed+=1;}else{failed+=1;println!("FAIL: {}",names[i as usize]);}
+        i+=1;
+    }
+    println!("Config/CTFE tests: {} passed, {} failed",passed,failed);
+    if failed>0{1}else{0}
+}

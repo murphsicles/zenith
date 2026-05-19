@@ -1,0 +1,702 @@
+// Zenith — hardened test suite
+// 50 tests: CRUD, edge cases, compaction, persistence, CTFE, config validation
+
+use zenith::{Config, Db};
+
+extern fn unlink(path: string) -> i64;
+extern fn rmdir(path: string) -> i64;
+
+// ─────────────────────────────────────────────
+// Basic CRUD (5)
+// ─────────────────────────────────────────────
+
+fn test_open_close() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    db.is_open()
+}
+
+fn test_set_get() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100);
+    tree.get(42) == 100
+}
+
+fn test_get_missing() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.get(999) == 0
+}
+
+fn test_update() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100);
+    tree.insert(42, 200);
+    tree.get(42) == 200
+}
+
+fn test_delete_existing() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100);
+    let deleted = tree.delete(42);
+    let val = tree.get(42);
+    deleted && val == 0
+}
+
+// ─────────────────────────────────────────────
+// Edge cases (14)
+// ─────────────────────────────────────────────
+
+fn test_delete_nonexistent() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.delete(42) == false
+}
+
+fn test_key_zero() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(0, 999);
+    tree.get(0) == 999
+}
+
+fn test_value_zero() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(77, 0);
+    tree.get(77) == 0
+}
+
+fn test_negative_keys() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(-1, 100);
+    tree.insert(-100, 200);
+    tree.insert(-9999, 300);
+    tree.get(-1) == 100 && tree.get(-100) == 200 && tree.get(-9999) == 300
+}
+
+fn test_delete_reinsert() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100);
+    tree.delete(42);
+    let v1 = tree.get(42);
+    tree.insert(42, 200);
+    let v2 = tree.get(42);
+    v1 == 0 && v2 == 200
+}
+
+fn test_large_values() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(1, 9223372036854775807);
+    tree.insert(2, 0);
+    tree.get(1) == 9223372036854775807 && tree.get(2) == 0
+}
+
+fn test_duplicate_insert_same_value() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100);
+    tree.insert(42, 100);
+    tree.get(42) == 100
+}
+
+fn test_insert_delete_interleaved() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(1, 10);
+    tree.insert(2, 20);
+    tree.delete(1);
+    tree.insert(3, 30);
+    tree.delete(2);
+    tree.insert(4, 40);
+    tree.get(3) == 30 && tree.get(4) == 40 && tree.get(1) == 0 && tree.get(2) == 0
+}
+
+fn test_mass_delete_all() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let mut i: i64 = 0;
+    while i < 100 {
+        tree.insert(i, i);
+        i += 1;
+    }
+    let mut j: i64 = 0;
+    while j < 100 {
+        tree.delete(j);
+        j += 1;
+    }
+    let mut ok: bool = true;
+    let mut k: i64 = 0;
+    while k < 100 {
+        if tree.get(k) != 0 {
+            ok = false;
+        }
+        k += 1;
+    }
+    ok
+}
+
+fn test_reinsert_after_mass_delete() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let mut i: i64 = 0;
+    while i < 100 {
+        tree.insert(i, i);
+        i += 1;
+    }
+    let mut j: i64 = 0;
+    while j < 100 {
+        tree.delete(j);
+        j += 1;
+    }
+    let mut k: i64 = 0;
+    while k < 100 {
+        tree.insert(k, k + 1000);
+        k += 1;
+    }
+    let mut ok: bool = true;
+    let mut l: i64 = 0;
+    while l < 100 {
+        if tree.get(l) != l + 1000 {
+            ok = false;
+        }
+        l += 1;
+    }
+    ok
+}
+
+fn test_delete_nonexistent_after_inserts() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let mut i: i64 = 0;
+    while i < 50 {
+        tree.insert(i, i);
+        i += 1;
+    }
+    tree.delete(999) == false && tree.delete(-100) == false && tree.delete(99999) == false
+}
+
+fn test_empty_tree_get_returns_zero() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.get(0) == 0 && tree.get(42) == 0 && tree.get(-1) == 0 && tree.get(9999999) == 0
+}
+
+// ─────────────────────────────────────────────
+// Multiple keys — unsorted insert (1)
+// ─────────────────────────────────────────────
+
+fn test_multi_key() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(10, 1);
+    tree.insert(20, 2);
+    tree.insert(30, 3);
+    tree.insert(5, 0);
+    tree.insert(15, 4);
+    tree.insert(25, 5);
+    tree.get(10) == 1 && tree.get(20) == 2 && tree.get(30) == 3
+    && tree.get(5) == 0 && tree.get(15) == 4 && tree.get(25) == 5
+}
+
+// ─────────────────────────────────────────────
+// B+ tree node splits & large batches (4)
+// ─────────────────────────────────────────────
+
+fn test_tree_split() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let mut i: i64 = 0;
+    while i < 1000 {
+        tree.insert(i, i * 2);
+        i += 1;
+    }
+    let mut ok: bool = true;
+    let mut j: i64 = 0;
+    while j < 1000 {
+        if tree.get(j) != j * 2 {
+            ok = false;
+        }
+        j += 1;
+    }
+    ok
+}
+
+fn test_large_batch() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let count: i64 = 10000;
+    let mut i: i64 = 0;
+    while i < count {
+        tree.insert(i, count - i);
+        i += 1;
+    }
+    let mut ok: bool = true;
+    let mut j: i64 = 0;
+    while j < count {
+        if tree.get(j) != count - j {
+            ok = false;
+        }
+        j += 1;
+    }
+    ok
+}
+
+fn test_reverse_insert() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let mut i: i64 = 999;
+    while i >= 0 {
+        tree.insert(i, i + 1000);
+        i -= 1;
+    }
+    let mut ok: bool = true;
+    let mut j: i64 = 0;
+    while j < 1000 {
+        if tree.get(j) != j + 1000 {
+            ok = false;
+        }
+        j += 1;
+    }
+    ok
+}
+
+fn test_sparse_keys() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(1, 10);
+    tree.insert(1000000, 20);
+    tree.insert(2000000000, 30);
+    tree.get(1) == 10 && tree.get(1000000) == 20 && tree.get(2000000000) == 30
+}
+
+// ─────────────────────────────────────────────
+// Compaction (4)
+// ─────────────────────────────────────────────
+
+fn test_compact_empty() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let merged = tree.compact();
+    merged == 0
+}
+
+fn test_compact_underfull() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let mut i: i64 = 0;
+    while i < 500 {
+        tree.insert(i, i);
+        i += 1;
+    }
+    let mut j: i64 = 10;
+    while j < 490 {
+        tree.delete(j);
+        j += 1;
+    }
+    let merged = tree.compact();
+    let v0 = tree.get(0);
+    let v9 = tree.get(9);
+    let v490 = tree.get(490);
+    let v499 = tree.get(499);
+    v0 == 0 && v9 == 9 && v490 == 490 && v499 == 499
+}
+
+fn test_compact_twice() -> bool {
+    // Compacting an already-compacted tree should be a no-op
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(1, 10);
+    tree.insert(2, 20);
+    tree.compact();
+    let m2 = tree.compact();
+    tree.get(1) == 10 && tree.get(2) == 20 && m2 == 0
+}
+
+fn test_compact_sparse() -> bool {
+    // Insert in a sparse pattern, delete most, compact
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let mut i: i64 = 0;
+    while i < 1000 {
+        tree.insert(i * 100, i);
+        i += 1;
+    }
+    let mut j: i64 = 0;
+    while j < 1000 {
+        if j % 3 != 0 {
+            tree.delete(j * 100);
+        }
+        j += 1;
+    }
+    tree.compact();
+    let mut ok: bool = true;
+    let mut k: i64 = 0;
+    while k < 1000 {
+        if k % 3 == 0 {
+            if tree.get(k * 100) != k {
+                ok = false;
+            }
+        }
+        k += 1;
+    }
+    ok
+}
+
+// ─────────────────────────────────────────────
+// Db convenience methods (3)
+// ─────────────────────────────────────────────
+
+fn test_db_set_get() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    db.set(1, 100);
+    db.set(2, 200);
+    db.get(1) == 100 && db.get(2) == 200
+}
+
+fn test_db_delete() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    db.set(1, 100);
+    let deleted = db.delete(1);
+    let after = db.get(1);
+    deleted && after == 0
+}
+
+fn test_db_overwrite() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    db.set(1, 100);
+    db.set(1, 999);
+    db.get(1) == 999
+}
+
+// ─────────────────────────────────────────────
+// Multiple trees (3)
+// ─────────────────────────────────────────────
+
+fn test_two_trees_isolated() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let t1 = db.open_tree("alpha");
+    let t2 = db.open_tree("beta");
+    t1.insert(1, 100);
+    t2.insert(1, 200);
+    t1.get(1) == 100 && t2.get(1) == 200
+}
+
+fn test_tree_count() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let _t1 = db.open_tree("alpha");
+    let _t2 = db.open_tree("beta");
+    db.tree_count() >= 2
+}
+
+fn test_tree_is_open() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    db.is_open()
+}
+
+// ─────────────────────────────────────────────
+// Hot cache (2)
+// ─────────────────────────────────────────────
+
+fn test_hot_cache_repeated_get() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100);
+    let r1 = tree.get(42);
+    let r2 = tree.get(42);
+    let r3 = tree.get(42);
+    r1 == 100 && r2 == 100 && r3 == 100
+}
+
+fn test_hot_cache_negative() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let r1 = tree.get(999);
+    let r2 = tree.get(999);
+    let r3 = tree.get(999);
+    r1 == 0 && r2 == 0 && r3 == 0
+}
+
+// ─────────────────────────────────────────────
+// Flush (2)
+// ─────────────────────────────────────────────
+
+fn test_flush_temporary() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    db.set(1, 100);
+    let flushed = db.flush();
+    let val = db.get(1);
+    flushed && val == 100
+}
+
+fn test_flush_twice() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    db.set(1, 100);
+    let f1 = db.flush();
+    let f2 = db.flush();
+    f1 && f2 && db.get(1) == 100
+}
+
+// ─────────────────────────────────────────────
+// Config validation (8)
+// ─────────────────────────────────────────────
+
+fn test_config_valid() -> bool {
+    let config = Config::new()
+        .path("/tmp/zenith_test")
+        .cache_size(64 * 1024 * 1024)
+        .compression_level(3)
+        .leaf_fanout(1024);
+    let result = config.validate();
+    if result { true } else { false }
+}
+
+fn test_config_empty_path_fails() -> bool {
+    let config = Config::new()
+        .path("")
+        .temporary(false);
+    config.validate() == false
+}
+
+fn test_config_tiny_cache_fails() -> bool {
+    let config = Config::new()
+        .path("/tmp/zenith_test")
+        .cache_size(512);
+    config.validate() == false
+}
+
+fn test_config_small_fanout_fails() -> bool {
+    let config = Config::new()
+        .path("/tmp/zenith_test")
+        .leaf_fanout(4);
+    config.validate() == false
+}
+
+fn test_config_min_fanout_valid() -> bool {
+    let config = Config::new()
+        .path("/tmp/zenith_test")
+        .leaf_fanout(16);
+    config.validate()
+}
+
+fn test_config_max_fanout_valid() -> bool {
+    let config = Config::new()
+        .path("/tmp/zenith_test")
+        .leaf_fanout(1024);
+    config.validate()
+}
+
+fn test_config_compression_off() -> bool {
+    let config = Config::new()
+        .path("/tmp/zenith_test")
+        .compression_level(0);
+    config.validate()
+}
+
+fn test_config_cache_size_min() -> bool {
+    let config = Config::new()
+        .path("/tmp/zenith_test")
+        .cache_size(1024 * 1024);
+    config.validate()
+}
+
+// ─────────────────────────────────────────────
+// CTFE: Size classes (6)
+// ─────────────────────────────────────────────
+
+fn test_size_class_constants() -> bool {
+    zenith::heap::MIN_ALLOC == 32
+    && zenith::heap::MAX_ALLOC == 16 * 1024 * 1024
+    && zenith::heap::NUM_CLASSES == 64
+}
+
+fn test_slot_size_for_class() -> bool {
+    zenith::heap::slot_size_for_class(0) == 32
+    && zenith::heap::slot_size_for_class(1) > 32
+}
+
+fn test_size_class_index() -> bool {
+    let s0 = zenith::heap::size_class_index(32);
+    let s1 = zenith::heap::size_class_index(64);
+    let s2 = zenith::heap::size_class_index(1024);
+    let s3 = zenith::heap::size_class_index(16 * 1024 * 1024);
+    s0 >= 0 && s1 > s0 && s2 > s1
+}
+
+fn test_class_boundaries() -> bool {
+    // Each class handles allocations up to its upper bound
+    let c0 = zenith::heap::size_class_index(32);
+    let c1 = zenith::heap::size_class_index(33);
+    let c_mid = zenith::heap::size_class_index(1000);
+    c0 == 0 && c1 > c0 && c_mid < 63
+}
+
+fn test_sizes_monotonic() -> bool {
+    let s0 = zenith::heap::slot_size_for_class(0);
+    let s10 = zenith::heap::slot_size_for_class(10);
+    let s30 = zenith::heap::slot_size_for_class(30);
+    let s63 = zenith::heap::slot_size_for_class(63);
+    s63 > s30 && s30 > s10 && s10 > s0
+}
+
+fn test_first_class_exact() -> bool {
+    zenith::heap::slot_size_for_class(0) == 32
+    && zenith::heap::size_class_index(32) == 0
+    && zenith::heap::size_class_index(31) == 0
+}
+
+// ─────────────────────────────────────────────
+// Main test runner with named output
+// ─────────────────────────────────────────────
+
+fn main() -> i64 {
+    let tests: [fn() -> bool; 50] = [
+        // CRUD (5)
+        test_open_close,
+        test_set_get,
+        test_get_missing,
+        test_update,
+        test_delete_existing,
+
+        // Edge cases (14)
+        test_delete_nonexistent,
+        test_key_zero,
+        test_value_zero,
+        test_negative_keys,
+        test_delete_reinsert,
+        test_large_values,
+        test_duplicate_insert_same_value,
+        test_insert_delete_interleaved,
+        test_mass_delete_all,
+        test_reinsert_after_mass_delete,
+        test_delete_nonexistent_after_inserts,
+        test_empty_tree_get_returns_zero,
+
+        // Multi-key (1)
+        test_multi_key,
+
+        // Tree splits & batches (4)
+        test_tree_split,
+        test_large_batch,
+        test_reverse_insert,
+        test_sparse_keys,
+
+        // Compaction (4)
+        test_compact_empty,
+        test_compact_underfull,
+        test_compact_twice,
+        test_compact_sparse,
+
+        // Db convenience (3)
+        test_db_set_get,
+        test_db_delete,
+        test_db_overwrite,
+
+        // Multiple trees (3)
+        test_two_trees_isolated,
+        test_tree_count,
+        test_tree_is_open,
+
+        // Hot cache (2)
+        test_hot_cache_repeated_get,
+        test_hot_cache_negative,
+
+        // Flush (2)
+        test_flush_temporary,
+        test_flush_twice,
+
+        // Config validation (8)
+        test_config_valid,
+        test_config_empty_path_fails,
+        test_config_tiny_cache_fails,
+        test_config_small_fanout_fails,
+        test_config_min_fanout_valid,
+        test_config_max_fanout_valid,
+        test_config_compression_off,
+        test_config_cache_size_min,
+
+        // CTFE size classes (6)
+        test_size_class_constants,
+        test_slot_size_for_class,
+        test_size_class_index,
+        test_class_boundaries,
+        test_sizes_monotonic,
+        test_first_class_exact,
+    ];
+
+    let test_names: [string; 50] = [
+        "open_close", "set_get", "get_missing", "update", "delete_existing",
+        "delete_nonexistent", "key_zero", "value_zero", "negative_keys", "delete_reinsert",
+        "large_values", "duplicate_insert", "interleaved_ops", "mass_delete_all", "reinsert_after_mass_del",
+        "delete_nonexistent_after_inserts", "empty_tree_returns_zero",
+        "multi_key",
+        "tree_split", "large_batch", "reverse_insert", "sparse_keys",
+        "compact_empty", "compact_underfull", "compact_twice", "compact_sparse",
+        "db_set_get", "db_delete", "db_overwrite",
+        "two_trees", "tree_count", "tree_is_open",
+        "hot_cache_repeated", "hot_cache_negative",
+        "flush_temporary", "flush_twice",
+        "config_valid", "config_empty_path", "config_tiny_cache", "config_small_fanout",
+        "config_min_fanout", "config_max_fanout", "config_compression_off", "config_cache_size_min",
+        "ctfe_constants", "ctfe_slot_size", "ctfe_size_index", "ctfe_boundaries", "ctfe_sizes_monotonic", "ctfe_first_class",
+    ];
+
+    let mut passed: i64 = 0;
+    let mut failed: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 50 {
+        let test = tests[i as usize];
+        let name = test_names[i as usize];
+        if test() {
+            passed += 1;
+        } else {
+            failed += 1;
+            println!("FAILED: {}", name);
+        }
+        i += 1;
+    }
+
+    println!("Zenith tests: {} passed, {} failed", passed, failed);
+    if failed > 0 { 1 } else { 0 }
+}

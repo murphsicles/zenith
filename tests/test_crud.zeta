@@ -1,0 +1,151 @@
+// Zenith CRUD + edge case tests
+use zenith::{Config, Db};
+
+fn test_open_close() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config); db.is_open()
+}
+fn test_set_get() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100); tree.get(42) == 100
+}
+fn test_get_missing() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.get(999) == 0
+}
+fn test_update() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100); tree.insert(42, 200);
+    tree.get(42) == 200
+}
+fn test_delete_existing() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100);
+    let deleted = tree.delete(42);
+    let val = tree.get(42);
+    deleted && val == 0
+}
+fn test_delete_nonexistent() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.delete(42) == false
+}
+fn test_key_zero() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(0, 999); tree.get(0) == 999
+}
+fn test_value_zero() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(77, 0); tree.get(77) == 0
+}
+fn test_negative_keys() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(-1, 100); tree.insert(-100, 200); tree.insert(-9999, 300);
+    tree.get(-1) == 100 && tree.get(-100) == 200 && tree.get(-9999) == 300
+}
+fn test_delete_reinsert() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100); tree.delete(42);
+    let v1 = tree.get(42);
+    tree.insert(42, 200);
+    let v2 = tree.get(42);
+    v1 == 0 && v2 == 200
+}
+fn test_large_values() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(1, 9223372036854775807);
+    tree.insert(2, 0);
+    tree.get(1) == 9223372036854775807 && tree.get(2) == 0
+}
+fn test_duplicate_insert() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(42, 100); tree.insert(42, 100);
+    tree.get(42) == 100
+}
+fn test_interleaved_ops() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.insert(1, 10); tree.insert(2, 20); tree.delete(1);
+    tree.insert(3, 30); tree.delete(2); tree.insert(4, 40);
+    tree.get(3) == 30 && tree.get(4) == 40 && tree.get(1) == 0 && tree.get(2) == 0
+}
+fn test_mass_delete_all() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let mut i: i64 = 0; while i < 100 { tree.insert(i, i); i += 1; }
+    let mut j: i64 = 0; while j < 100 { tree.delete(j); j += 1; }
+    let mut ok: bool = true;
+    let mut k: i64 = 0; while k < 100 { if tree.get(k) != 0 { ok = false; } k += 1; }
+    ok
+}
+fn test_reinsert_after_mass_del() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let mut i: i64 = 0; while i < 100 { tree.insert(i, i); i += 1; }
+    let mut j: i64 = 0; while j < 100 { tree.delete(j); j += 1; }
+    let mut k: i64 = 0; while k < 100 { tree.insert(k, k + 1000); k += 1; }
+    let mut ok: bool = true;
+    let mut l: i64 = 0; while l < 100 { if tree.get(l) != l + 1000 { ok = false; } l += 1; }
+    ok
+}
+fn test_del_nonexistent_after_ins() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    let mut i: i64 = 0; while i < 50 { tree.insert(i, i); i += 1; }
+    tree.delete(999) == false && tree.delete(-100) == false && tree.delete(99999) == false
+}
+fn test_empty_tree() -> bool {
+    let config = Config::new().temporary(true);
+    let db = Db::open(config);
+    let tree = db.open_tree("default");
+    tree.get(0) == 0 && tree.get(42) == 0 && tree.get(-1) == 0
+}
+
+fn main() -> i64 {
+    let tests: [fn() -> bool; 17] = [
+        test_open_close, test_set_get, test_get_missing, test_update, test_delete_existing,
+        test_delete_nonexistent, test_key_zero, test_value_zero, test_negative_keys, test_delete_reinsert,
+        test_large_values, test_duplicate_insert, test_interleaved_ops, test_mass_delete_all,
+        test_reinsert_after_mass_del, test_del_nonexistent_after_ins, test_empty_tree,
+    ];
+    let names: [string; 17] = [
+        "open_close","set_get","get_missing","update","delete_existing",
+        "del_nonexistent","key_zero","value_zero","negative_keys","delete_reinsert",
+        "large_values","duplicate_insert","interleaved_ops","mass_delete_all",
+        "reinsert_after_del","del_nonexistent_after_ins","empty_tree",
+    ];
+    let mut passed: i64 = 0; let mut failed: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 17 {
+        if tests[i as usize]() { passed += 1; }
+        else { failed += 1; println!("FAIL: {}", names[i as usize]); }
+        i += 1;
+    }
+    println!("CRUD tests: {} passed, {} failed", passed, failed);
+    if failed > 0 { 1 } else { 0 }
+}

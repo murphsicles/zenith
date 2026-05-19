@@ -35,6 +35,8 @@ pub fn crc32c(data: i64, len: i64) -> u32 {
     let mut crc: u64 = 0xFFFFFFFF;
     let mut off: i64 = 0;
     let mut remaining = len;
+    let mask_ff: u32 = 255;
+    let flip: u32 = 0xFFFFFFFF;
     
     // Process 8 bytes at a time with hardware CRC
     while remaining >= 8 {
@@ -50,14 +52,16 @@ pub fn crc32c(data: i64, len: i64) -> u32 {
     while remaining > 0 {
         unsafe {
             let byte = *((data + off) as *const u8);
-            let idx = ((crc as u32 ^ (byte as u32)) & 0xFF) as usize;
-            crc = ((crc >> 8) as u32 ^ CRC_TABLE[idx]) as u64;
+            let crc_lo: u32 = crc as u32;
+            let byte32: u32 = byte as u32;
+            let idx: usize = ((crc_lo ^ byte32) & mask_ff) as usize;
+            crc = (((crc >> 8) as u32) ^ CRC_TABLE[idx]) as u64;
         }
         off += 1;
         remaining -= 1;
     }
     
-    (crc as u32) ^ 0xFFFFFFFF
+    (crc as u32) ^ flip
 }
 
 /// Compute CRC over a range of i64 values (for node data)

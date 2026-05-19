@@ -1,0 +1,91 @@
+// Zenith B+ tree tests
+use zenith::{Config, Db};
+
+fn test_multi_key() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c); let t = d.open_tree("default");
+    t.insert(10,1);t.insert(20,2);t.insert(30,3);t.insert(5,0);t.insert(15,4);t.insert(25,5);
+    t.get(10)==1&&t.get(20)==2&&t.get(30)==3&&t.get(5)==0&&t.get(15)==4&&t.get(25)==5
+}
+fn test_tree_split() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c); let t = d.open_tree("default");
+    let mut i=0;while i<1000{t.insert(i,i*2);i+=1;}
+    let mut ok=true;let mut j=0;while j<1000{if t.get(j)!=j*2{ok=false;}j+=1;}ok
+}
+fn test_large_batch() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c); let t = d.open_tree("default");
+    let cnt=10000;let mut i=0;while i<cnt{t.insert(i,cnt-i);i+=1;}
+    let mut ok=true;let mut j=0;while j<cnt{if t.get(j)!=cnt-j{ok=false;}j+=1;}ok
+}
+fn test_reverse_insert() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c); let t = d.open_tree("default");
+    let mut i=999;while i>=0{t.insert(i,i+1000);i-=1;}
+    let mut ok=true;let mut j=0;while j<1000{if t.get(j)!=j+1000{ok=false;}j+=1;}ok
+}
+fn test_sparse_keys() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c); let t = d.open_tree("default");
+    t.insert(1,10);t.insert(1000000,20);t.insert(2000000000,30);
+    t.get(1)==10&&t.get(1000000)==20&&t.get(2000000000)==30
+}
+fn test_compact_empty() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c); let t = d.open_tree("default");
+    t.compact()==0
+}
+fn test_compact_underfull() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c); let t = d.open_tree("default");
+    let mut i=0;while i<500{t.insert(i,i);i+=1;}
+    let mut j=10;while j<490{t.delete(j);j+=1;}
+    t.compact();t.get(0)==0&&t.get(9)==9&&t.get(490)==490&&t.get(499)==499
+}
+fn test_compact_twice() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c); let t = d.open_tree("default");
+    t.insert(1,10);t.insert(2,20);t.compact();let m2=t.compact();
+    t.get(1)==10&&t.get(2)==20&&m2==0
+}
+fn test_compact_sparse() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c); let t = d.open_tree("default");
+    let mut i=0;while i<1000{t.insert(i*100,i);i+=1;}
+    let mut j=0;while j<1000{if j%3!=0{t.delete(j*100);}j+=1;}
+    t.compact();
+    let mut ok=true;let mut k=0;while k<1000{if k%3==0&&t.get(k*100)!=k{ok=false;}k+=1;}ok
+}
+fn test_db_set_get() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c);
+    d.set(1,100);d.set(2,200);d.get(1)==100&&d.get(2)==200
+}
+fn test_db_delete() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c);
+    d.set(1,100);let del=d.delete(1);let aft=d.get(1);del&&aft==0
+}
+fn test_db_overwrite() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c);
+    d.set(1,100);d.set(1,999);d.get(1)==999
+}
+fn test_two_trees() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c);
+    let t1=d.open_tree("a");let t2=d.open_tree("b");
+    t1.insert(1,100);t2.insert(1,200);t1.get(1)==100&&t2.get(1)==200
+}
+fn test_tree_count() -> bool {
+    let c = Config::new().temporary(true); let d = Db::open(c);
+    let _=d.open_tree("a");let _=d.open_tree("b");d.tree_count()>=2
+}
+
+fn main() -> i64 {
+    let tests:[fn()->bool;14]=[
+        test_multi_key,test_tree_split,test_large_batch,test_reverse_insert,test_sparse_keys,
+        test_compact_empty,test_compact_underfull,test_compact_twice,test_compact_sparse,
+        test_db_set_get,test_db_delete,test_db_overwrite,test_two_trees,test_tree_count,
+    ];
+    let names:[string;14]=[
+        "multi_key","tree_split","large_batch","reverse_insert","sparse_keys",
+        "compact_empty","compact_underfull","compact_twice","compact_sparse",
+        "db_set_get","db_delete","db_overwrite","two_trees","tree_count",
+    ];
+    let mut passed=0;let mut failed=0;let mut i=0;
+    while i<14{
+        if tests[i as usize](){passed+=1;}else{failed+=1;println!("FAIL: {}",names[i as usize]);}
+        i+=1;
+    }
+    println!("Tree tests: {} passed, {} failed",passed,failed);
+    if failed>0{1}else{0}
+}
