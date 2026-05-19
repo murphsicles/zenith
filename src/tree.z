@@ -136,6 +136,7 @@ impl Tree {
             hot_cache: HotCache::new(),
             last_key: 0,
             last_leaf: 0,
+        }
     }
     
     fn get_arena(&self) -> &mut Arena {
